@@ -1,49 +1,14 @@
-# Python
+.venv/
+Backend/.venv/
 __pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-env/
-venv/
-ENV/
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-
-# Generated Images (outputs)
-processed_images/
-tutorial_steps/
-*.jpg
-*.png
-*.jpeg
-
-# IDE
+*.pyc
+node_modules/
+Frontend/node_modules/
+FrontendOLD/
+Backend/processed_images/
+Backend/tutorial_steps/
+Frontend/dist/
 .vscode/
-.idea/
-*.swp
-*.swo
-*~
-
-# Environment
-.env
-.env.local
-
-# OS
 .DS_Store
-Thumbs.db
-
-# Logs
 *.log
+.env

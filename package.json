@@ -1,0 +1,13 @@
+{
+  "name": "proportion",
+  "version": "1.0.0",
+  "scripts": {
+    "backend": "cd Backend && .venv\\Scripts\\python.exe -m uvicorn main:app --reload --port 8000",
+    "frontend": "cd Frontend && npm run dev",
+    "dev": "concurrently \"npm run backend\" \"npm run frontend\"",
+    "start": "concurrently \"npm run backend\" \"npm run frontend\""
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1"
+  }
+}
