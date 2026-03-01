@@ -24,11 +24,12 @@ const ProportionScore = ({ score }: { score: number }) => {
             fill="none"
             className="stroke-primary score-ring"
             strokeWidth="6"
+            strokeDasharray={circumference}
             strokeDashoffset={offset}
           />
         </svg>
         <div className="absolute inset-0 flex items-center justify-center">
-          <span className="text-3xl font-black">{score}</span>
+          <span className="text-3xl font-black">{score.toFixed(1)}</span>
         </div>
       </div>
       <span className="text-sm text-muted-foreground font-medium">Proportion Score</span>
@@ -37,63 +38,133 @@ const ProportionScore = ({ score }: { score: number }) => {
 };
 
 const AnalysisDashboard = ({ result }: AnalysisDashboardProps) => {
-  const analysis = result.ml_analyses?.[0];
+  // Get the first face's data
+  const firstFace = result.faces?.[0];
+  const measurements = firstFace?.measurements_px;
+  const ratios = firstFace?.proportional_ratios;
+  const analysis = firstFace?.analysis;
+  
+  // Extract overall score and face shape
+  const overallScore = analysis?.overall_score || 0;
+  const faceShape = analysis?.face_shape || "Unknown";
 
   return (
     <div className="space-y-6">
       {/* Score and Shape */}
       <div className="grid grid-cols-2 gap-4">
         <div className="glass-card p-6 flex flex-col items-center justify-center">
-          <ProportionScore score={result.proportion_score} />
+          <ProportionScore score={overallScore} />
         </div>
         <div className="glass-card p-6 flex flex-col items-center justify-center gap-3">
           <div className="w-16 h-16 rounded-2xl bg-accent/10 flex items-center justify-center">
             <span className="text-2xl">
-              {result.face_shape === "Oval" ? "🥚" :
-               result.face_shape === "Round" ? "🔵" :
-               result.face_shape === "Square" ? "🟦" : "📐"}
+              {faceShape.includes("Oval") || faceShape.includes("Balanced") ? "🥚" :
+               faceShape.includes("Round") || faceShape.includes("Square") ? "🔵" :
+               faceShape.includes("Oblong") || faceShape.includes("Long") ? "📏" : "📐"}
             </span>
           </div>
           <div className="text-center">
-            <p className="text-2xl font-bold">{result.face_shape}</p>
+            <p className="text-2xl font-bold">{faceShape}</p>
             <p className="text-sm text-muted-foreground">Face Shape</p>
           </div>
         </div>
       </div>
 
-      {/* Measurements */}
-      {analysis && (
+      {/* Detailed Measurements */}
+      {measurements && (
         <div className="glass-card p-6 space-y-4">
           <h3 className="text-lg font-bold">Detailed Measurements</h3>
           <div className="grid gap-3">
             <MeasurementRow
               label="Face Dimensions"
-              value={`${Math.round(analysis.face_width)} × ${Math.round(analysis.face_height)} px`}
+              value={`${Math.round(measurements.face_width || 0)} × ${Math.round(measurements.face_height || 0)} px`}
             />
             <MeasurementRow
               label="Eye Distance"
-              value={`${Math.round(analysis.eye_distance)} px`}
+              value={`${Math.round(measurements.eye_distance || 0)} px`}
             />
             <MeasurementRow
-              label="Nose-to-Chin Ratio"
-              value={`${(analysis.nose_chin_ratio * 100).toFixed(1)}%`}
+              label="Nose to Chin"
+              value={`${Math.round(measurements.nose_to_chin || 0)} px`}
+            />
+            <MeasurementRow
+              label="Mouth Width"
+              value={`${Math.round(measurements.mouth_width || 0)} px`}
+            />
+            <MeasurementRow
+              label="Nose Width"
+              value={`${Math.round(measurements.nose_width || 0)} px`}
             />
           </div>
         </div>
       )}
 
-      {/* Facial Thirds */}
-      {analysis?.thirds && (
+      {/* Proportional Ratios */}
+      {ratios && (
         <div className="glass-card p-6 space-y-4">
-          <h3 className="text-lg font-bold">Facial Thirds</h3>
+          <h3 className="text-lg font-bold">Proportional Ratios</h3>
           <div className="space-y-3">
-            <ThirdBar label="Upper Third" value={analysis.thirds.upper} ideal={33.3} />
-            <ThirdBar label="Middle Third" value={analysis.thirds.middle} ideal={33.3} />
-            <ThirdBar label="Lower Third" value={analysis.thirds.lower} ideal={33.3} />
+            <RatioBar
+              label="Eye to Face Width"
+              value={ratios.eye_to_face_width || 0}
+              ideal={0.46}
+              format={(v) => v.toFixed(3)}
+            />
+            <RatioBar
+              label="Nose to Face Height"
+              value={ratios.nose_to_face_height || 0}
+              ideal={0.33}
+              format={(v) => v.toFixed(3)}
+            />
+            <RatioBar
+              label="Face Aspect Ratio"
+              value={ratios.face_aspect_ratio || 0}
+              ideal={0.75}
+              format={(v) => v.toFixed(3)}
+            />
+            <RatioBar
+              label="Mouth to Face Width"
+              value={ratios.mouth_to_face_width || 0}
+              ideal={0.5}
+              format={(v) => v.toFixed(3)}
+            />
           </div>
-          <p className="text-xs text-muted-foreground">
-            Classical ideal proportions divide the face into equal thirds
+          <p className="text-xs text-muted-foreground mt-3">
+            Ratios are compared against classical ideal proportions (Loomis method)
           </p>
+        </div>
+      )}
+
+      {/* Detailed Comparison */}
+      {analysis?.comparisons && (
+        <div className="glass-card p-6 space-y-4">
+          <h3 className="text-lg font-bold">Proportion Analysis</h3>
+          <div className="space-y-3">
+            {Object.entries(analysis.comparisons).map(([key, data]: [string, any]) => (
+              <ComparisonRow
+                key={key}
+                label={formatLabel(key)}
+                detected={data.detected}
+                ideal={data.ideal}
+                score={data.score}
+              />
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Recommendations */}
+      {analysis?.recommendations && analysis.recommendations.length > 0 && (
+        <div className="glass-card p-6 space-y-3">
+          <h3 className="text-lg font-bold">Artist Notes</h3>
+          <ul className="space-y-2">
+            {analysis.recommendations.map((rec: string, idx: number) => (
+              <li key={idx} className="flex items-start gap-2 text-sm">
+                <span className="text-primary mt-0.5">•</span>
+                <span className="text-muted-foreground">{rec}</span>
+              </li>
+            ))}
+          </ul>
         </div>
       )}
     </div>
@@ -103,30 +174,86 @@ const AnalysisDashboard = ({ result }: AnalysisDashboardProps) => {
 const MeasurementRow = ({ label, value }: { label: string; value: string }) => (
   <div className="flex items-center justify-between py-2 border-b border-border/30 last:border-0">
     <span className="text-sm text-muted-foreground">{label}</span>
-    <span className="mono-text text-foreground">{value}</span>
+    <span className="font-mono text-foreground font-medium">{value}</span>
   </div>
 );
 
-const ThirdBar = ({ label, value, ideal }: { label: string; value: number; ideal: number }) => {
+const RatioBar = ({ 
+  label, 
+  value, 
+  ideal, 
+  format 
+}: { 
+  label: string; 
+  value: number; 
+  ideal: number;
+  format: (v: number) => string;
+}) => {
   const deviation = Math.abs(value - ideal);
-  const color = deviation < 3 ? "bg-green-500" : deviation < 6 ? "bg-yellow-500" : "bg-accent";
+  const deviationPercent = (deviation / ideal) * 100;
+  const color = deviationPercent < 10 ? "bg-green-500" : deviationPercent < 20 ? "bg-yellow-500" : "bg-red-500";
+  
+  // Normalize to percentage for display (0-100%)
+  const displayPercent = Math.min((value / (ideal * 2)) * 100, 100);
   
   return (
     <div className="space-y-1.5">
       <div className="flex justify-between text-sm">
         <span className="text-muted-foreground">{label}</span>
-        <span className="mono-text">{value.toFixed(1)}%</span>
+        <span className="font-mono text-foreground">{format(value)}</span>
       </div>
-      <div className="h-2 rounded-full bg-secondary overflow-hidden">
+      <div className="h-2 rounded-full bg-secondary overflow-hidden relative">
         <motion.div
           initial={{ width: 0 }}
-          animate={{ width: `${value}%` }}
+          animate={{ width: `${displayPercent}%` }}
           transition={{ duration: 1, delay: 0.3, ease: [0.16, 1, 0.3, 1] }}
           className={`h-full rounded-full ${color}`}
+        />
+        {/* Ideal marker */}
+        <div 
+          className="absolute top-0 w-0.5 h-full bg-white/50"
+          style={{ left: `${Math.min((ideal / (ideal * 2)) * 100, 100)}%` }}
         />
       </div>
     </div>
   );
+};
+
+const ComparisonRow = ({ 
+  label, 
+  detected, 
+  ideal, 
+  score 
+}: { 
+  label: string; 
+  detected: number; 
+  ideal: number; 
+  score: number;
+}) => {
+  const color = score > 80 ? "text-green-500" : score > 60 ? "text-yellow-500" : "text-red-500";
+  
+  return (
+    <div className="flex items-center justify-between py-2 border-b border-border/30 last:border-0">
+      <div className="flex-1">
+        <p className="text-sm font-medium">{label}</p>
+        <p className="text-xs text-muted-foreground">
+          Detected: {detected.toFixed(3)} | Ideal: {ideal.toFixed(3)}
+        </p>
+      </div>
+      <div className={`text-lg font-bold ${color}`}>
+        {score.toFixed(0)}%
+      </div>
+    </div>
+  );
+};
+
+const formatLabel = (key: string): string => {
+  const labels: Record<string, string> = {
+    eye_spacing: "Eye Spacing",
+    nose_chin_ratio: "Nose-Chin Ratio",
+    face_aspect: "Face Aspect Ratio",
+  };
+  return labels[key] || key.replace(/_/g, " ").replace(/\b\w/g, l => l.toUpperCase());
 };
 
 export default AnalysisDashboard;

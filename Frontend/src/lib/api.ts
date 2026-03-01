@@ -11,27 +11,51 @@ const api = axios.create({
 // TYPE DEFINITIONS
 // ============================================
 
+export interface FaceMeasurements {
+  eye_distance?: number;
+  nose_to_chin?: number;
+  face_width?: number;
+  face_height?: number;
+  mouth_width?: number;
+  nose_width?: number;
+}
+
+export interface ProportionalRatios {
+  eye_to_face_width?: number;
+  nose_to_face_height?: number;
+  face_aspect_ratio?: number;
+  mouth_to_face_width?: number;
+  nose_to_face_width?: number;
+}
+
+export interface ProportionComparison {
+  detected: number;
+  ideal: number;
+  score: number;
+}
+
+export interface FaceAnalysis {
+  overall_score?: number;
+  face_shape?: string;
+  comparisons?: {
+    [key: string]: ProportionComparison;
+  };
+  recommendations?: string[];
+}
+
+export interface FaceData {
+  measurements_px?: FaceMeasurements;
+  proportional_ratios?: ProportionalRatios;
+  analysis?: FaceAnalysis;
+}
+
 export interface ProcessResult {
   status: string;
-  filename: string;
-  faces_detected: number;
-  processed_image: string;
-  measurements: {
-    face_width: number;
-    face_height: number;
-    eye_distance: number;
-    nose_to_chin: number;
-  };
-  proportion_score: number;
-  face_shape: string;
-  symmetry?: number;
-  ml_analyses: Array<{
-    face_width: number;
-    face_height: number;
-    eye_distance: number;
-    nose_chin_ratio: number;
-    thirds: { upper: number; middle: number; lower: number };
-  }>;
+  face_count?: number;
+  faces?: FaceData[];
+  processed_image?: string;
+  tutorial_steps?: string[];
+  timestamp?: string;
 }
 
 export interface TutorialStep {
@@ -43,8 +67,8 @@ export interface TutorialResult {
   status: string;
   filename: string;
   tutorial_steps: TutorialStep[];
-  proportion_score: number;
-  face_shape: string;
+  face_count?: number;
+  faces?: FaceData[];
 }
 
 export interface RealtimeGridData {
@@ -82,6 +106,35 @@ export interface RealtimeGridData {
   timestamp?: string;
 }
 
+// ============================================
+// SKETCH CANVAS
+// ============================================
+
+export interface SketchCanvasResult {
+  canvas_image: string;  // base64 data URL
+  ratios: {
+    measurements_px: {
+      eye_distance: number;
+      nose_to_chin: number;
+      face_width: number;
+      face_height: number;
+      mouth_width: number;
+      nose_width: number;
+    };
+    proportional_ratios: {
+      eye_to_face_width: number;
+      nose_to_face_height: number;
+      face_aspect_ratio: number;
+      mouth_to_face_width: number;
+      nose_to_face_width: number;
+    };
+  };
+  analysis: {
+    overall_score: number;
+    face_shape: string;
+    recommendations: string[];
+  };
+}
 
 // ============================================
 // STATIC IMAGE ANALYSIS
@@ -113,6 +166,18 @@ export async function processTutorial(file: File): Promise<TutorialResult> {
   return response.data;
 }
 
+export async function generateSketchCanvas(file: File): Promise<SketchCanvasResult> {
+  const formData = new FormData();
+  formData.append('file', file);
+
+  const response = await api.post<SketchCanvasResult>('/sketch-canvas', formData, {
+    headers: { 'Content-Type': 'multipart/form-data' },
+  });
+
+  return response.data;
+}
+
+
 // ============================================
 // DOWNLOAD HELPERS
 // ============================================
@@ -133,11 +198,11 @@ export function createRealtimeWebSocket(): WebSocket {
   const ws = new WebSocket(`ws://localhost:8000/ws/realtime-grid`);
   
   ws.onopen = () => {
-    console.log('✅ WebSocket connected to backend');
+    console.log('WebSocket connected to backend');
   };
   
   ws.onerror = (error) => {
-    console.error('❌ WebSocket error:', error);
+    console.error('WebSocket error:', error);
   };
   
   ws.onclose = () => {

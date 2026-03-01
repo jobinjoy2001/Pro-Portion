@@ -4,6 +4,7 @@ from fastapi.responses import FileResponse
 import cv2
 import numpy as np
 import mediapipe as mp
+import urllib.request
 import math
 import os
 from datetime import datetime
@@ -31,12 +32,23 @@ mp_drawing = mp.solutions.drawing_utils
 mp_drawing_styles = mp.solutions.drawing_styles
 
 
+# For static image processing (upload endpoints)
 face_mesh = mp_face_mesh.FaceMesh(
     static_image_mode=True,
     max_num_faces=10,
     refine_landmarks=True,
-    min_detection_confidence=0.2
+    min_detection_confidence=0.5
 )
+
+# For real-time WebSocket streaming
+face_mesh_video = mp_face_mesh.FaceMesh(
+    static_image_mode=False,
+    max_num_faces=1,
+    refine_landmarks=False,    
+    min_detection_confidence=0.5,
+    min_tracking_confidence=0.5
+)
+
 
 
 face_detection = mp_face_detection.FaceDetection(
@@ -56,6 +68,26 @@ OUTPUT_DIR = "processed_images"
 TUTORIAL_DIR = "tutorial_steps"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(TUTORIAL_DIR, exist_ok=True)
+
+# ── OpenCV DNN Face Detector (more accurate than Haar cascade) ──────
+
+_PROTO = "https://raw.githubusercontent.com/opencv/opencv/master/samples/dnn/face_detector/deploy.prototxt"
+_MODEL = "https://raw.githubusercontent.com/opencv/opencv_3rdparty/dnn_samples_face_detector_20170830/res10_300x300_ssd_iter_140000.caffemodel"
+
+_proto_path = "deploy.prototxt"
+_model_path = "res10_300x300_ssd.caffemodel"
+
+# Download only if not already present
+if not os.path.exists(_proto_path):
+    print("Downloading face detector prototxt...")
+    urllib.request.urlretrieve(_PROTO, _proto_path)
+
+if not os.path.exists(_model_path):
+    print("Downloading face detector model...")
+    urllib.request.urlretrieve(_MODEL, _model_path)
+
+dnn_face_detector = cv2.dnn.readNetFromCaffe(_proto_path, _model_path)
+print("DNN face detector loaded")
 
 
 # Classical/Ideal facial proportions (Loomis method + Golden Ratio)
@@ -213,22 +245,38 @@ def compute_body_ratios(landmarks, img_width, img_height):
         return None
 
 
-def get_face_bounds(face_landmarks, width, height):
-    """Extract face boundary coordinates"""
-    top = face_landmarks[10]
-    bottom = face_landmarks[152]
-    left = face_landmarks[234]
-    right = face_landmarks[454]
-    
+def get_face_bounds(face_landmarks, img_w, img_h, margin=0.20):
+    """
+    Returns face bounding box with generous margin so tilted/angled
+    faces never get cropped. Uses FACE_OVAL landmarks only.
+    """
+    oval_ids = [
+        10,338,297,332,284,251,389,356,454,323,361,288,
+        397,365,379,378,400,377,152,148,176,149,150,136,
+        172,58,132,93,234,127,162,21,54,103,67,109
+    ]
+    xs = [face_landmarks[i].x * img_w for i in oval_ids]
+    ys = [face_landmarks[i].y * img_h for i in oval_ids]
+
+    fw = max(xs) - min(xs)
+    fh = max(ys) - min(ys)
+
+    x_left  = int(max(0,       min(xs) - fw * margin))
+    x_right = int(min(img_w,   max(xs) + fw * margin))
+    y_top   = int(max(0,       min(ys) - fh * margin))
+    y_bot   = int(min(img_h,   max(ys) + fh * margin))
+
     return {
-        'x_center': int((left.x + right.x) / 2 * width),
-        'y_top': int(top.y * height),
-        'y_bottom': int(bottom.y * height),
-        'x_left': int(left.x * width),
-        'x_right': int(right.x * width),
-        'face_height': int(bottom.y * height) - int(top.y * height),
-        'face_width': int(right.x * width) - int(left.x * width)
+        "x_left":    x_left,
+        "x_right":   x_right,
+        "y_top":     y_top,
+        "y_bottom":  y_bot,
+        "x_center":  (x_left + x_right) // 2,
+        "y_center":  (y_top + y_bot) // 2,
+        "face_width":  x_right - x_left,
+        "face_height": y_bot - y_top,
     }
+
 
 
 def add_measurements_overlay(img, face_landmarks, width, height, step_name=""):
@@ -290,232 +338,505 @@ def add_measurements_overlay(img, face_landmarks, width, height, step_name=""):
     return img
 
 
-def draw_tutorial_step(img, face_landmarks, face_id, step_number, width, height):
-    """Draw progressive Loomis grid construction steps"""
-    bounds = get_face_bounds(face_landmarks, width, height)
-    
-    colors = [(0, 255, 0), (255, 0, 0), (0, 0, 255), (255, 255, 0), (255, 0, 255)]
-    color = colors[face_id % len(colors)]
-    
+FACE_OVAL_INDICES = [
+    10, 338, 297, 332, 284, 251, 389, 356, 454,
+    323, 361, 288, 397, 365, 379, 378, 400, 377,
+    152, 148, 176, 149, 150, 136, 172, 58, 132,
+    93, 234, 127, 162, 21, 54, 103, 67, 109
+]
+
+def get_precise_face_bounds(face_landmarks, img_w, img_h):
+    xs = [face_landmarks[i].x * img_w for i in FACE_OVAL_INDICES]
+    ys = [face_landmarks[i].y * img_h for i in FACE_OVAL_INDICES]
+
+    raw_top    = face_landmarks[10].y  * img_h
+    raw_bottom = face_landmarks[152].y * img_h
+    raw_left   = min(xs)
+    raw_right  = max(xs)
+
+    face_w = raw_right - raw_left
+    face_h = raw_bottom - raw_top
+
+    # Clamp bottom to chin only — no neck
+    clamped_bottom = raw_top + face_h * 1.08
+
+    pad_x     = face_w * 0.12
+    pad_y_top = face_h * 0.10
+
+    return {
+        "x_left":     int(max(0,     raw_left  - pad_x)),
+        "x_right":    int(min(img_w, raw_right + pad_x)),
+        "y_top":      int(max(0,     raw_top   - pad_y_top)),
+        "y_bottom":   int(min(img_h, clamped_bottom)),
+        "x_center":   int((raw_left + raw_right) / 2),
+        "face_width":  int(raw_right - raw_left + 2 * pad_x),
+        "face_height": int(clamped_bottom - raw_top + pad_y_top),
+    }
+
+
+
+COLORS = [
+    (0, 255, 0), (255, 0, 0), (0, 0, 255), (255, 255, 0),
+    (0, 255, 255), (255, 0, 255), (128, 255, 0), (255, 128, 0)
+]
+
+def draw_tutorial_step(img, face_landmarks, face_id, step_number, img_w, img_h):
     canvas = img.copy()
-    
-    # Calculate key lines
-    face_height = bounds['y_bottom'] - bounds['y_top']
-    y_hairline = bounds['y_top'] + face_height // 6
-    y_eyebrow = bounds['y_top'] + face_height // 3
-    y_nose = bounds['y_top'] + 2 * face_height // 3
-    
-    left_eye = face_landmarks[33]
-    right_eye = face_landmarks[362]
-    y_eye_line = int((left_eye.y + right_eye.y) / 2 * height)
-    
-    step_name = ""
-    
+    color  = COLORS[face_id % len(COLORS)]
+
+    bounds = get_precise_face_bounds(face_landmarks, img_w, img_h)
+    xl = bounds["x_left"]
+    xr = bounds["x_right"]
+    yt = bounds["y_top"]
+    yb = bounds["y_bottom"]
+    xc = bounds["x_center"]
+
+    def lm_y(idx): return int(face_landmarks[idx].y * img_h)
+    def lm_x(idx): return int(face_landmarks[idx].x * img_w)
+
+    # All horizontal positions come directly from MediaPipe landmarks
+    y_hairline = lm_y(10)
+    y_eyebrow  = int((lm_y(70) + lm_y(300)) / 2)
+    y_nose     = lm_y(94)
+    y_eyeline  = int((lm_y(33) + lm_y(263)) / 2)
+    y_mouth    = int((lm_y(61) + lm_y(291)) / 2)
+
+    # Always draw the bounding box
+    cv2.rectangle(canvas, (xl, yt), (xr, yb), color, 4)
+
+    # Center line only from step 2 onwards
+    if step_number >= 2:
+        cv2.line(canvas, (xc, yt), (xc, yb), color, 3)
+
+
     if step_number == 1:
-        # Step 1: Bounding box
-        cv2.rectangle(canvas, 
-                     (bounds['x_left'], bounds['y_top']), 
-                     (bounds['x_right'], bounds['y_bottom']), 
-                     color, 4)
         step_name = "Step 1: Face Bounds"
-        cv2.putText(canvas, step_name, 
-                   (bounds['x_left'], bounds['y_top'] - 20),
-                   cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 3)
-    
+
     elif step_number == 2:
-        # Step 2: Vertical centerline
-        cv2.rectangle(canvas, 
-                     (bounds['x_left'], bounds['y_top']), 
-                     (bounds['x_right'], bounds['y_bottom']), 
-                     color, 4)
-        cv2.line(canvas, 
-                (bounds['x_center'], bounds['y_top']), 
-                (bounds['x_center'], bounds['y_bottom']), 
-                color, 3)
         step_name = "Step 2: Center Line"
-        cv2.putText(canvas, step_name, 
-                   (bounds['x_left'], bounds['y_top'] - 20),
-                   cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 3)
-    
+
     elif step_number == 3:
-        # Step 3: Horizontal thirds
-        cv2.rectangle(canvas, 
-                     (bounds['x_left'], bounds['y_top']), 
-                     (bounds['x_right'], bounds['y_bottom']), 
-                     color, 4)
-        cv2.line(canvas, 
-                (bounds['x_center'], bounds['y_top']), 
-                (bounds['x_center'], bounds['y_bottom']), 
-                color, 3)
-        
-        # Hairline
-        cv2.line(canvas, 
-                (bounds['x_left'], y_hairline), 
-                (bounds['x_right'], y_hairline), 
-                (255, 200, 0), 2)
-        cv2.putText(canvas, "Hairline", 
-                   (bounds['x_right'] + 10, y_hairline),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 200, 0), 2)
-        
-        # Eyebrow
-        cv2.line(canvas, 
-                (bounds['x_left'], y_eyebrow), 
-                (bounds['x_right'], y_eyebrow), 
-                (200, 150, 0), 2)
-        cv2.putText(canvas, "Eyebrow", 
-                   (bounds['x_right'] + 10, y_eyebrow),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 150, 0), 2)
-        
-        # Nose
-        cv2.line(canvas, 
-                (bounds['x_left'], y_nose), 
-                (bounds['x_right'], y_nose), 
-                (150, 100, 0), 2)
-        cv2.putText(canvas, "Nose", 
-                   (bounds['x_right'] + 10, y_nose),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (150, 100, 0), 2)
-        
+        cv2.line(canvas, (xl, y_hairline), (xr, y_hairline), (255, 200, 0), 2)
+        cv2.putText(canvas, "Hairline", (xr + 10, y_hairline),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 200, 0), 2)
+
+        cv2.line(canvas, (xl, y_eyebrow), (xr, y_eyebrow), (200, 150, 0), 2)
+        cv2.putText(canvas, "Eyebrow", (xr + 10, y_eyebrow),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 150, 0), 2)
+
+        cv2.line(canvas, (xl, y_nose), (xr, y_nose), (150, 100, 0), 2)
+        cv2.putText(canvas, "Nose", (xr + 10, y_nose),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (150, 100, 0), 2)
+
         step_name = "Step 3: Horizontal Thirds"
-        cv2.putText(canvas, step_name, 
-                   (bounds['x_left'], bounds['y_top'] - 20),
-                   cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 3)
-    
+
     elif step_number == 4:
-        # Step 4: Eye line
-        cv2.rectangle(canvas, 
-                     (bounds['x_left'], bounds['y_top']), 
-                     (bounds['x_right'], bounds['y_bottom']), 
-                     color, 4)
-        cv2.line(canvas, 
-                (bounds['x_center'], bounds['y_top']), 
-                (bounds['x_center'], bounds['y_bottom']), 
-                color, 3)
-        cv2.line(canvas, (bounds['x_left'], y_hairline), (bounds['x_right'], y_hairline), (255, 200, 0), 2)
-        cv2.line(canvas, (bounds['x_left'], y_eyebrow), (bounds['x_right'], y_eyebrow), (200, 150, 0), 2)
-        cv2.line(canvas, (bounds['x_left'], y_nose), (bounds['x_right'], y_nose), (150, 100, 0), 2)
-        
-        # Eye line
-        cv2.line(canvas, 
-                (int(left_eye.x * width), y_eye_line), 
-                (int(right_eye.x * width), y_eye_line), 
-                (0, 255, 255), 3)
-        cv2.putText(canvas, "Eye Line", 
-                   (bounds['x_right'] + 10, y_eye_line),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-        
+        cv2.line(canvas, (xl, y_hairline), (xr, y_hairline), (255, 200, 0), 2)
+        cv2.line(canvas, (xl, y_eyebrow),  (xr, y_eyebrow),  (200, 150, 0), 2)
+        cv2.line(canvas, (xl, y_nose),     (xr, y_nose),     (150, 100, 0), 2)
+
+        cv2.line(canvas,
+                 (lm_x(33), y_eyeline),
+                 (lm_x(263), y_eyeline),
+                 (0, 255, 255), 3)
+        cv2.putText(canvas, "Eye Line", (xr + 10, y_eyeline),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+
         step_name = "Step 4: Eye Line"
-        cv2.putText(canvas, step_name, 
-                   (bounds['x_left'], bounds['y_top'] - 20),
-                   cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 3)
-    
+
     elif step_number == 5:
-        # Step 5: Face outline
-        cv2.rectangle(canvas, 
-                     (bounds['x_left'], bounds['y_top']), 
-                     (bounds['x_right'], bounds['y_bottom']), 
-                     color, 4)
-        cv2.line(canvas, (bounds['x_center'], bounds['y_top']), (bounds['x_center'], bounds['y_bottom']), color, 3)
-        cv2.line(canvas, (bounds['x_left'], y_hairline), (bounds['x_right'], y_hairline), (255, 200, 0), 2)
-        cv2.line(canvas, (bounds['x_left'], y_eyebrow), (bounds['x_right'], y_eyebrow), (200, 150, 0), 2)
-        cv2.line(canvas, (bounds['x_left'], y_nose), (bounds['x_right'], y_nose), (150, 100, 0), 2)
-        cv2.line(canvas, (int(left_eye.x * width), y_eye_line), (int(right_eye.x * width), y_eye_line), (0, 255, 255), 3)
-        
-        # Jaw contour
-        jaw_points = [234, 93, 132, 58, 172, 136, 150, 149, 176, 148, 152, 377, 400, 378, 379, 365, 397, 288, 361, 454]
-        contour_pts = []
-        for idx in jaw_points:
-            pt = face_landmarks[idx]
-            contour_pts.append([int(pt.x * width), int(pt.y * height)])
-        contour_pts = np.array(contour_pts, dtype=np.int32)
-        cv2.polylines(canvas, [contour_pts], False, (255, 0, 255), 2)
-        
+        cv2.line(canvas, (xl, y_hairline), (xr, y_hairline), (255, 200, 0), 2)
+        cv2.line(canvas, (xl, y_eyebrow),  (xr, y_eyebrow),  (200, 150, 0), 2)
+        cv2.line(canvas, (xl, y_nose),     (xr, y_nose),     (150, 100, 0), 2)
+        cv2.line(canvas,
+                 (lm_x(33), y_eyeline),
+                 (lm_x(263), y_eyeline),
+                 (0, 255, 255), 3)
+
+        jaw_pts = [234,93,132,58,172,136,150,149,176,148,152,
+                   377,400,378,379,365,397,288,361,454]
+        contour = np.array(
+            [(lm_x(i), lm_y(i)) for i in jaw_pts], dtype=np.int32
+        )
+        cv2.polylines(canvas, [contour], False, (255, 0, 255), 2)
+
         step_name = "Step 5: Face Outline"
-        cv2.putText(canvas, step_name, 
-                   (bounds['x_left'], bounds['y_top'] - 20),
-                   cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 3)
-    
+
     elif step_number == 6:
-        # Step 6: Complete grid
-        cv2.rectangle(canvas, 
-                     (bounds['x_left'], bounds['y_top']), 
-                     (bounds['x_right'], bounds['y_bottom']), 
-                     color, 4)
-        cv2.line(canvas, (bounds['x_center'], bounds['y_top']), (bounds['x_center'], bounds['y_bottom']), color, 3)
-        cv2.line(canvas, (bounds['x_left'], y_hairline), (bounds['x_right'], y_hairline), (255, 200, 0), 2)
-        cv2.line(canvas, (bounds['x_left'], y_eyebrow), (bounds['x_right'], y_eyebrow), (200, 150, 0), 2)
-        cv2.line(canvas, (bounds['x_left'], y_nose), (bounds['x_right'], y_nose), (150, 100, 0), 2)
-        cv2.line(canvas, (int(left_eye.x * width), y_eye_line), (int(right_eye.x * width), y_eye_line), (0, 255, 255), 3)
-        
-        # Nose marker
-        nose_tip = face_landmarks[1]
-        cv2.circle(canvas, (int(nose_tip.x * width), int(nose_tip.y * height)), 5, (0, 150, 255), -1)
-        
-        # Chin marker
-        chin = face_landmarks[152]
-        cv2.circle(canvas, (int(chin.x * width), int(chin.y * height)), 5, (255, 100, 0), -1)
-        
+        cv2.line(canvas, (xl, y_hairline), (xr, y_hairline), (255, 200, 0), 2)
+        cv2.line(canvas, (xl, y_eyebrow),  (xr, y_eyebrow),  (200, 150, 0), 2)
+        cv2.line(canvas, (xl, y_nose),     (xr, y_nose),     (150, 100, 0), 2)
+        cv2.line(canvas,
+                 (lm_x(33), y_eyeline),
+                 (lm_x(263), y_eyeline),
+                 (0, 255, 255), 3)
+
+        jaw_pts = [234,93,132,58,172,136,150,149,176,148,152,
+                   377,400,378,379,365,397,288,361,454]
+        contour = np.array(
+            [(lm_x(i), lm_y(i)) for i in jaw_pts], dtype=np.int32
+        )
+        cv2.polylines(canvas, [contour], False, (255, 0, 255), 2)
+
+        cv2.circle(canvas, (lm_x(4),   lm_y(4)),   5, (0, 150, 255), -1)
+        cv2.circle(canvas, (lm_x(152), lm_y(152)), 5, (255, 100, 0), -1)
+
+        cv2.line(canvas, (xl, y_mouth), (xr, y_mouth), (0, 200, 100), 2)
+        cv2.putText(canvas, "Mouth", (xr + 10, y_mouth),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 100), 2)
+
         step_name = "Step 6: Complete Grid"
-        cv2.putText(canvas, step_name, 
-                   (bounds['x_left'], bounds['y_top'] - 20),
-                   cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 3)
-    
-    # Add measurements overlay to all steps
-    canvas = add_measurements_overlay(canvas, face_landmarks, width, height, step_name)
+
+    cv2.putText(canvas, step_name, (xl, yt - 20),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 3)
+
     
     return canvas
 
+def detect_face_roi(img):
+    """
+    Use OpenCV DNN to detect face bounding box.
+    Returns (x, y, w, h) of best face or None.
+    """
+    h, w = img.shape[:2]
+    blob = cv2.dnn.blobFromImage(
+        cv2.resize(img, (300, 300)), 1.0,
+        (300, 300), (104.0, 177.0, 123.0)
+    )
+    dnn_face_detector.setInput(blob)
+    detections = dnn_face_detector.forward()
+
+    best = None
+    best_conf = 0.5  # minimum confidence threshold
+
+    for i in range(detections.shape[2]):
+        conf = detections[0, 0, i, 2]
+        if conf > best_conf:
+            box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
+            x1, y1, x2, y2 = box.astype(int)
+            # Clamp to image bounds
+            x1 = max(0, x1);  y1 = max(0, y1)
+            x2 = min(w, x2);  y2 = min(h, y2)
+            best_conf = conf
+            best = (x1, y1, x2 - x1, y2 - y1)
+
+    return best
+
 
 def draw_loomis_grid(img, face_landmarks, face_id):
-    """Draw complete Loomis grid (for /process endpoint)"""
+    """
+    Draw Loomis grid using DNN-detected face ROI for accurate placement.
+    MediaPipe landmarks are used for precise line positions within that ROI.
+    """
     height, width = img.shape[:2]
-    
+
     try:
-        top = face_landmarks[10]
-        bottom = face_landmarks[152]
-        left = face_landmarks[234]
-        right = face_landmarks[454]
-        
-        x_center = int((left.x + right.x) / 2 * width)
-        y_top = int(top.y * height)
-        y_bottom = int(bottom.y * height)
-        x_left = int(left.x * width)
-        x_right = int(right.x * width)
-        
-        colors = [(0, 255, 0), (255, 0, 0), (0, 0, 255), (255, 255, 0), (255, 0, 255), 
-                  (0, 255, 255), (128, 0, 128), (255, 128, 0), (0, 128, 255), (128, 255, 0)]
+        def px(idx): return int(face_landmarks[idx].x * width)
+        def py(idx): return int(face_landmarks[idx].y * height)
+
+        # ── Use DNN detector for tight accurate face bounds ──────────
+        roi = detect_face_roi(img)
+
+        if roi:
+            rx, ry, rw, rh = roi
+            x_left   = rx
+            x_right  = rx + rw
+            y_top    = ry
+            y_bottom = ry + rh
+        else:
+            # Fallback to MediaPipe oval if DNN misses
+            oval_ids = [10,338,297,332,284,251,389,356,454,323,361,288,
+                        397,365,379,378,400,377,152,148,176,149,150,136,
+                        172,58,132,93,234,127,162,21,54,103,67,109]
+            xs = [face_landmarks[i].x * width  for i in oval_ids]
+            ys = [face_landmarks[i].y * height for i in oval_ids]
+            x_left   = int(min(xs))
+            x_right  = int(max(xs))
+            y_top    = py(10)
+            y_bottom = py(152)
+
+        x_center = (x_left + x_right) // 2
+        face_h   = y_bottom - y_top
+        face_w   = x_right  - x_left
+
+        # ── MediaPipe for precise horizontal line positions ───────────
+        y_brow   = (py(70)  + py(300)) // 2
+        y_eye    = (py(33)  + py(263)) // 2
+        y_nose   = py(94)
+        y_mouth  = (py(61)  + py(291)) // 2
+
+        colors = [(0,255,0),(255,0,0),(0,0,255),(255,255,0),
+                  (255,0,255),(0,255,255),(128,255,0),(255,128,0)]
         color = colors[face_id % len(colors)]
-        
-        # Vertical center
-        cv2.line(img, (x_center, y_top), (x_center, y_bottom), color, 3)
-        
-        # Horizontal thirds
-        face_height = y_bottom - y_top
-        if face_height > 0:
-            y_third1 = y_top + face_height // 3
-            y_third2 = y_top + 2 * face_height // 3
-            cv2.line(img, (x_left, y_third1), (x_right, y_third1), color, 3)
-            cv2.line(img, (x_left, y_third2), (x_right, y_third2), color, 3)
-        
-        # Bounding box
-        cv2.rectangle(img, (x_left, y_top), (x_right, y_bottom), color, 4)
-        
-        # Eye line
-        left_eye = face_landmarks[33]
-        right_eye = face_landmarks[362]
-        cv2.line(img, 
-                 (int(left_eye.x * width), int(left_eye.y * height)),
-                 (int(right_eye.x * width), int(right_eye.y * height)),
-                 color, 3)
-        
-        # Label
-        label = f"Face {face_id + 1}"
-        cv2.putText(img, label, (x_left, y_top - 15), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, color, 3)
-        
+
+        # ── Draw bounding box ─────────────────────────────────────────
+        cv2.rectangle(img, (x_left, y_top), (x_right, y_bottom), color, 2)
+
+        # ── Vertical center line ──────────────────────────────────────
+        cv2.line(img, (x_center, y_top), (x_center, y_bottom),
+                 (255, 0, 255), 2, cv2.LINE_AA)
+
+        # ── Horizontal proportion lines ───────────────────────────────
+        lines = [
+            (y_brow,  (0, 215, 255), "Eyebrow"),
+            (y_eye,   (0, 255, 255), "Eye Line"),
+            (y_nose,  (0, 165, 255), "Nose"),
+            (y_mouth, (203,192,255), "Mouth"),
+        ]
+        for y, c, label in lines:
+            # Only draw if y is within the detected face bounds
+            if y_top <= y <= y_bottom:
+                cv2.line(img, (x_left, y), (x_right, y), c, 1, cv2.LINE_AA)
+                cv2.putText(img, label, (x_right + 5, y + 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, c, 1, cv2.LINE_AA)
+
+        # ── Measurements ─────────────────────────────────────────────
+        PX_TO_CM = 0.0264
+        cv2.putText(img, f"W:{face_w}px ({face_w*PX_TO_CM:.1f}cm)",
+                    (x_left, y_bottom + 18),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255,255,255), 1, cv2.LINE_AA)
+        cv2.putText(img, f"H:{face_h}px ({face_h*PX_TO_CM:.1f}cm)",
+                    (max(0, x_left - 95), (y_top + y_bottom)//2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255,255,255), 1, cv2.LINE_AA)
+
+        # ── Face label ────────────────────────────────────────────────
+        cv2.putText(img, f"Face {face_id+1}",
+                    (x_left, max(15, y_top - 10)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
+
     except Exception as e:
-        print(f"Error drawing grid for face {face_id + 1}: {e}")
-    
+        print(f"draw_loomis_grid error: {e}")
+
     return img
+
+
+
+# ── Exact MediaPipe face oval indices (ordered, no jumps) ─────────────
+FACE_OVAL = [
+    10, 338, 297, 332, 284, 251, 389, 356, 454,
+    323, 361, 288, 397, 365, 379, 378, 400, 377,
+    152, 148, 176, 149, 150, 136, 172, 58, 132,
+    93, 234, 127, 162, 21, 54, 103, 67, 109, 10
+]
+
+LEFT_EYE  = [33,246,161,160,159,158,157,173,133,155,154,153,145,144,163,7,33]
+RIGHT_EYE = [263,466,388,387,386,385,384,398,362,382,381,380,374,373,390,249,263]
+LEFT_BROW  = [46,53,52,65,55,107,66,105,63,70]
+RIGHT_BROW = [276,283,282,295,285,336,296,334,293,300]
+NOSE_BRIDGE = [168,6,197,195,5,4,1]
+NOSE_BASE   = [129,98,97,2,326,327,358]
+UPPER_LIP   = [61,185,40,39,37,0,267,269,270,409,291,308,310,311,312,13,82,81,80,191,78,61]
+LOWER_LIP   = [61,78,95,88,178,87,14,317,402,318,324,308,291,375,321,405,314,17,84,181,91,146,61]
+
+
+def draw_sketch_canvas(face_landmarks, img_w: int, img_h: int, canvas_w=900, canvas_h=1100):
+    """
+    Clean, professional Loomis construction diagram on white canvas.
+    Improved: smooth curves, anti-aliased, normalized proportions, clean labels.
+    """
+
+    # ── Canvas & landmark setup ──────────────────────────────────────
+    canvas = np.ones((canvas_h, canvas_w, 3), dtype=np.uint8) * 255
+    lms = face_landmarks
+    px_all = [(lm.x * img_w, lm.y * img_h) for lm in lms]
+
+    # ── Compute face bounds from oval ────────────────────────────────
+    FACE_OVAL = [10,338,297,332,284,251,389,356,454,323,361,288,
+                 397,365,379,378,400,377,152,148,176,149,150,136,
+                 172,58,132,93,234,127,162,21,54,103,67,109,10]
+
+    ox = [px_all[i][0] for i in FACE_OVAL]
+    oy = [px_all[i][1] for i in FACE_OVAL]
+    fx_min, fx_max = min(ox), max(ox)
+    fy_min, fy_max = min(oy), max(oy)
+    fw = fx_max - fx_min
+    fh = fy_max - fy_min
+
+    # Add margin
+    margin = 0.12
+    fx_min -= fw * margin;  fx_max += fw * margin
+    fy_min -= fh * margin;  fy_max += fh * margin
+    fw = fx_max - fx_min;   fh = fy_max - fy_min
+
+    # ── Scale to canvas ──────────────────────────────────────────────
+    pad = 90
+    scale_x = (canvas_w - 2 * pad) / fw
+    scale_y = (canvas_h - 2 * pad) / fh
+    scale   = min(scale_x, scale_y)
+
+    drawn_w = fw * scale;  drawn_h = fh * scale
+    off_x = (canvas_w - drawn_w) / 2
+    off_y = (canvas_h - drawn_h) / 2
+
+    def to_canvas(ix: float, iy: float):
+        return (int((ix - fx_min) * scale + off_x),
+                int((iy - fy_min) * scale + off_y))
+
+    def lm_pt(idx: int):
+        return to_canvas(*px_all[idx])
+
+    def draw_path(indices, color, thick=2, closed=False):
+        pts = np.array([lm_pt(i) for i in indices], dtype=np.int32)
+        cv2.polylines(canvas, [pts], closed, color, thick, cv2.LINE_AA)
+
+    # ── Bézier smooth helper ─────────────────────────────────────────
+    def smooth_polyline(pts_list, color, thick, n=120):
+        pts = np.array(pts_list, dtype=np.float32)
+        n_seg = len(pts)
+        out = []
+        for i in range(0, n_seg - 1, 3):
+            p0 = pts[min(i,     n_seg-1)]
+            p1 = pts[min(i+1,   n_seg-1)]
+            p2 = pts[min(i+2,   n_seg-1)]
+            p3 = pts[min(i+3,   n_seg-1)]
+            steps = max(8, n // max(1, n_seg // 3))
+            for t in np.linspace(0, 1, steps):
+                mt = 1 - t
+                x = mt**3*p0[0] + 3*mt**2*t*p1[0] + 3*mt*t**2*p2[0] + t**3*p3[0]
+                y = mt**3*p0[1] + 3*mt**2*t*p1[1] + 3*mt*t**2*p2[1] + t**3*p3[1]
+                out.append((int(x), int(y)))
+        arr = np.array(out, dtype=np.int32).reshape((-1, 1, 2))
+        cv2.polylines(canvas, [arr], False, color, thick, cv2.LINE_AA)
+
+    # ── Colors ───────────────────────────────────────────────────────
+    BLACK  = (20,  20,  20)
+    BLUE   = (180, 80,  40)   # BGR → warm blue for eyes
+    BROW_C = (30,  30,  30)
+    NOSE_C = (60,  40,  20)
+    LIP_C  = (40,  40, 160)   # BGR → red lips
+    GRID_C = (180, 80,  80)   # BGR → soft blue grid
+    LABEL_C= (120, 40,  40)
+    ARC_C  = (40, 160,  40)   # green orbital arc
+    EAR_C  = (140,140, 140)
+
+    # ════════════════════════════════════════════════════════════════
+    # 1. FACE OVAL — smooth Bézier
+    # ════════════════════════════════════════════════════════════════
+    oval_canvas_pts = [lm_pt(i) for i in FACE_OVAL]
+    smooth_polyline(oval_canvas_pts, BLACK, thick=3)
+
+    # ════════════════════════════════════════════════════════════════
+    # 2. EYES — polyline outline + iris circles
+    # ════════════════════════════════════════════════════════════════
+    LEFT_EYE  = [33,246,161,160,159,158,157,173,133,155,154,153,145,144,163,7,33]
+    RIGHT_EYE = [263,466,388,387,386,385,384,398,362,382,381,380,374,373,390,249,263]
+    draw_path(LEFT_EYE,  BLUE, 2)
+    draw_path(RIGHT_EYE, BLUE, 2)
+
+    for iris_idx, radius in [(468, 11), (473, 11)]:
+        if iris_idx < len(lms):
+            cv2.circle(canvas, lm_pt(iris_idx), radius, BLUE, 1, cv2.LINE_AA)
+            cv2.circle(canvas, lm_pt(iris_idx), 3,      BLUE, -1, cv2.LINE_AA)
+
+    # ════════════════════════════════════════════════════════════════
+    # 3. EYEBROWS
+    # ════════════════════════════════════════════════════════════════
+    LEFT_BROW  = [46,53,52,65,55,107,66,105,63,70]
+    RIGHT_BROW = [276,283,282,295,285,336,296,334,293,300]
+    draw_path(LEFT_BROW,  BROW_C, 2)
+    draw_path(RIGHT_BROW, BROW_C, 2)
+
+    # Orbital arc (green) — across brow tops
+    l_brow_top = lm_pt(70)
+    r_brow_top = lm_pt(300)
+    arc_mid    = lm_pt(168)  # nose bridge = arc midpoint
+    arc_pts    = np.array([l_brow_top, arc_mid, r_brow_top], dtype=np.int32)
+    cv2.polylines(canvas, [arc_pts], False, ARC_C, 1, cv2.LINE_AA)
+    cv2.putText(canvas, "Orbital Arc", (arc_mid[0] - 40, arc_mid[1] - 10),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.38, ARC_C, 1, cv2.LINE_AA)
+
+    # ════════════════════════════════════════════════════════════════
+    # 4. NOSE
+    # ════════════════════════════════════════════════════════════════
+    NOSE_BRIDGE = [168,6,197,195,5,4,1]
+    NOSE_BASE   = [129,98,97,2,326,327,358]
+    draw_path(NOSE_BRIDGE, NOSE_C, 2)
+    draw_path(NOSE_BASE,   NOSE_C, 2)
+    draw_path([64, 60, 2, 290, 294], NOSE_C, 1)   # nostril wings
+
+    # ════════════════════════════════════════════════════════════════
+    # 5. LIPS
+    # ════════════════════════════════════════════════════════════════
+    UPPER_LIP = [61,185,40,39,37,0,267,269,270,409,291,308,310,311,312,13,82,81,80,191,78,61]
+    LOWER_LIP = [61,78,95,88,178,87,14,317,402,318,324,308,291,375,321,405,314,17,84,181,91,146,61]
+    draw_path(UPPER_LIP, LIP_C, 2)
+    draw_path(LOWER_LIP, LIP_C, 2)
+
+    # ════════════════════════════════════════════════════════════════
+    # 6. EAR HINTS (soft gray)
+    # ════════════════════════════════════════════════════════════════
+    draw_path([127,234,93,132,58,172,136,150],        EAR_C, 1)
+    draw_path([356,454,323,361,288,397,365,379],       EAR_C, 1)
+
+    # ════════════════════════════════════════════════════════════════
+    # 7. LOOMIS PROPORTION GRID — normalized & clean
+    # ════════════════════════════════════════════════════════════════
+    top_c   = lm_pt(10)
+    bot_c   = lm_pt(152)
+    left_c  = lm_pt(234)
+    right_c = lm_pt(454)
+    l_eye_c = lm_pt(33)
+    r_eye_c = lm_pt(263)
+
+    cx      = (left_c[0] + right_c[0]) // 2
+    f_top   = top_c[1]
+    f_bot   = bot_c[1]
+    f_left  = left_c[0] - 18
+    f_right = right_c[0] + 18
+    f_h     = f_bot - f_top
+
+    # Normalize horizontal lines to exact Loomis thirds
+    y_hairline = f_top
+    y_brow     = f_top + int(f_h * 0.333)
+    y_nose_eye = f_top + int(f_h * 0.500)   # eye line = midpoint
+    y_nose     = f_top + int(f_h * 0.666)
+    y_mouth    = f_top + int(f_h * 0.833)
+    y_chin     = f_bot
+
+    # Vertical center axis (red)
+    cv2.line(canvas, (cx, f_top - 35), (cx, f_bot + 20),
+             (80, 80, 220), 1, cv2.LINE_AA)
+    cv2.putText(canvas, "1/2", (cx + 4, f_top - 38),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.42, LABEL_C, 1, cv2.LINE_AA)
+
+    # Horizontal thirds (soft blue)
+    thirds = [
+        (y_brow,     "1/3"),
+        (y_nose,     "1/3"),
+        (y_mouth,    ""),
+        (y_chin,     ""),
+    ]
+    for y, lbl in thirds:
+        cv2.line(canvas, (f_left - 10, y), (f_right + 10, y),
+                 GRID_C, 1, cv2.LINE_AA)
+        if lbl:
+            cv2.putText(canvas, lbl, (f_left - 48, y + 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, LABEL_C, 1, cv2.LINE_AA)
+
+    # Eye line (yellow/orange)
+    cv2.line(canvas, (f_left, y_nose_eye), (f_right + 80, y_nose_eye),
+             (0, 180, 220), 2, cv2.LINE_AA)
+    cv2.putText(canvas, "1/3  Forehead", (f_right + 14, y_nose_eye + 5),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 140, 180), 1, cv2.LINE_AA)
+
+    # Mouth line (blue)
+    cv2.line(canvas, (f_left, y_mouth), (f_right + 80, y_mouth),
+             (180, 120, 0), 2, cv2.LINE_AA)
+    cv2.putText(canvas, "Mouth", (f_right + 14, y_mouth + 5),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.38, (140, 100, 0), 1, cv2.LINE_AA)
+
+    # Nose+Eyes zone label
+    cv2.putText(canvas, "1/3  Nose+Eyes", (f_right + 14, y_nose + 5),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.38, LABEL_C, 1, cv2.LINE_AA)
+
+    # ════════════════════════════════════════════════════════════════
+    # 8. TITLE
+    # ════════════════════════════════════════════════════════════════
+    cv2.putText(canvas, "Loomis Construction  [Pro-Portion]",
+                (canvas_w // 2 - 200, 42),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.72, (40, 40, 40), 1, cv2.LINE_AA)
+
+    return canvas
 
 
 def draw_pose_wireframe(img, pose_landmarks):
@@ -804,40 +1125,43 @@ async def process_tutorial(file: UploadFile = File(...)):
         tutorial_images.append({
             "step": step,
             "description": step_descriptions[step - 1],
-            "url": f"/download-tutorial/{step_filename}"
+            "filename": step_filename
         })
         print(f"[OK] Step {step}: {step_descriptions[step - 1]}")
     
     # Calculate proportions and ML analysis
-    ratios = compute_face_ratios(face_landmarks, width, height)
-    ml_analysis = analyze_proportions_vs_ideal(ratios)
+    face_ratios = compute_face_ratios(face_landmarks, width, height)
+    analysis = analyze_proportions_vs_ideal(face_ratios)
     
-    print(f"ML Analysis Score: {ml_analysis['overall_score']}/100")
-    print(f"Face Shape: {ml_analysis['face_shape']}")
+    print(f"ML Analysis Score: {analysis['overall_score']:.1f}/100")
+    print(f"Face Shape: {analysis['face_shape']}")
     print(f"{'='*60}\n")
     
-    # Convert tutorial images to frontend format
+    # Format tutorial steps for frontend (TutorialStep interface)
     tutorial_steps_formatted = []
     for step_data in tutorial_images:
-        # Extract just the filename from the URL
-        filename = step_data["url"].replace("/download-tutorial/", "")
+        # Split description to get just the title part
+        title_part = step_data['description'].split(' - ')[0]
         tutorial_steps_formatted.append({
-            "title": f"Step {step_data['step']}: {step_data['description'].split(' - ')[0]}",
-            "filename": filename  # ← Frontend needs just the filename, not URL
+            "title": f"Step {step_data['step']}: {title_part}",
+            "filename": step_data['filename']
         })
-
+    
+    # Build face data object matching ProcessResult structure
+    face_data = {
+        "measurements_px": face_ratios.get("measurements_px", {}),
+        "proportional_ratios": face_ratios.get("proportional_ratios", {}),
+        "analysis": analysis
+    }
+    
+    # Return response matching TutorialResult interface
     return {
         "status": "success",
         "filename": file.filename,
-        "image_dimensions": {"width": width, "height": height},
-        "faces_detected": len(face_results.multi_face_landmarks),
-        "tutorial_steps": tutorial_steps_formatted,  # ← Use formatted version
-        "measurements": ratios["measurements_px"] if ratios else {},
-        "proportion_score": ml_analysis["overall_score"] if ml_analysis else 0,
-        "face_shape": ml_analysis["face_shape"] if ml_analysis else "Unknown",
-        "ml_analysis": ml_analysis
+        "tutorial_steps": tutorial_steps_formatted,
+        "face_count": 1,
+        "faces": [face_data]
     }
-
 
 
 @app.post("/process")
@@ -870,46 +1194,40 @@ async def process_image(file: UploadFile = File(...)):
     
     annotated_img = img.copy()
     
-    response = {
-        "status": "Processing complete",
-        "filename": file.filename,
-        "image_dimensions": {"width": width, "height": height},
-        "faces_detected": 0,
-        "bodies_detected": 0,
-        "face_analyses": [],
-        "body_analysis": None,
-        "ml_analyses": []
-    }
-    
     # Process faces
+    faces_data = []
     if face_results.multi_face_landmarks:
         num_faces = len(face_results.multi_face_landmarks)
-        response["faces_detected"] = num_faces
         print(f"[OK] Face Mesh: {num_faces} faces")
         
         for idx, face_landmarks_obj in enumerate(face_results.multi_face_landmarks):
             face_landmarks = face_landmarks_obj.landmark
-            face_ratios = compute_face_ratios(face_landmarks, width, height)
             
+            # Draw Loomis grid
             annotated_img = draw_loomis_grid(annotated_img, face_landmarks, idx)
             
+            # Compute ratios and measurements
+            face_ratios = compute_face_ratios(face_landmarks, width, height)
+            
             if face_ratios:
-                ml_analysis = analyze_proportions_vs_ideal(face_ratios)
+                # Analyze proportions
+                analysis = analyze_proportions_vs_ideal(face_ratios)
                 
-                response["face_analyses"].append({
-                    "face_number": idx + 1,
-                    "landmark_count": len(face_landmarks),
-                    "proportions": face_ratios
-                })
+                # Build face data object
+                face_data = {
+                    "measurements_px": face_ratios.get("measurements_px", {}),
+                    "proportional_ratios": face_ratios.get("proportional_ratios", {}),
+                    "analysis": analysis
+                }
                 
-                response["ml_analyses"].append({
-                    "face_number": idx + 1,
-                    "analysis": ml_analysis
-                })
+                faces_data.append(face_data)
+                
+                print(f"Face {idx + 1}: Score={analysis['overall_score']:.1f}, Shape={analysis['face_shape']}")
     else:
         print("[X] No faces detected")
     
-    # Process body
+    # Process body (optional - can be added later)
+    body_data = None
     if pose_results.pose_landmarks:
         print(f"[OK] Body detected")
         pose_landmarks = pose_results.pose_landmarks.landmark
@@ -917,37 +1235,81 @@ async def process_image(file: UploadFile = File(...)):
         
         annotated_img = draw_pose_wireframe(annotated_img, pose_results.pose_landmarks)
         
-        response["bodies_detected"] = 1
         if body_ratios:
-            response["body_analysis"] = {
+            body_data = {
                 "detected": True,
                 "landmark_count": len(pose_landmarks),
                 "proportions": body_ratios
             }
     
-    # Save image
+    # Save annotated image
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_filename = f"processed_{timestamp}.jpg"
     output_path = os.path.join(OUTPUT_DIR, output_filename)
     
     cv2.imwrite(output_path, annotated_img, [cv2.IMWRITE_JPEG_QUALITY, 95])
     print(f"Saved: {output_path}")
+    
+    # Encode image to base64 for frontend
+    _, buffer = cv2.imencode('.jpg', annotated_img, [cv2.IMWRITE_JPEG_QUALITY, 95])
+    img_base64 = base64.b64encode(buffer).decode('utf-8')
+    
     print(f"{'='*50}\n")
     
-    response["processed_image_url"] = f"/download/{output_filename}"
-    response["processed_image"] = output_filename  # ← ADD THIS LINE
-
-    # Add simplified fields for frontend
-    if response["ml_analyses"]:
-        first_analysis = response["ml_analyses"][0]["analysis"]
-        response["proportion_score"] = first_analysis["overall_score"]
-        response["face_shape"] = first_analysis["face_shape"]
-        response["symmetry"] = first_analysis["overall_score"]  # Using same score for now
-
-    if response["face_analyses"]:
-        response["measurements"] = response["face_analyses"][0]["proportions"]["measurements_px"]
-
+    # Build response matching frontend interface
+    response = {
+        "status": "success" if faces_data else "no_face",
+        "face_count": len(faces_data),
+        "faces": faces_data,
+        "processed_image": img_base64,  # Base64 encoded image
+        "processed_image_url": f"/download/{output_filename}",  # Download URL
+        "timestamp": timestamp
+    }
+    
+    # Add body analysis if detected
+    if body_data:
+        response["body_analysis"] = body_data
+    
     return response
+
+
+@app.post("/sketch-canvas")
+async def generate_sketch_canvas(file: UploadFile = File(...)):
+    try:
+        contents = await file.read()
+        nparr    = np.frombuffer(contents, np.uint8)
+        img      = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        if img is None:
+            raise HTTPException(status_code=400, detail="Invalid image")
+
+        img_h, img_w = img.shape[:2]          # ← real pixel dimensions
+        rgb          = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        results      = face_mesh.process(rgb)
+
+        if not results.multi_face_landmarks:
+            raise HTTPException(status_code=400, detail="No face detected")
+
+        landmarks = results.multi_face_landmarks[0].landmark
+
+        # ✅ Pass img_w and img_h so coordinates map correctly
+        canvas = draw_sketch_canvas(landmarks,
+                                    img_w=img_w, img_h=img_h,
+                                    canvas_w=900, canvas_h=1100)
+
+        _, buffer = cv2.imencode('.png', canvas)
+        b64       = base64.b64encode(buffer).decode('utf-8')
+        ratios    = compute_face_ratios(landmarks, img_w, img_h)
+        analysis  = analyze_proportions_vs_ideal(ratios) if ratios else None
+
+        return {
+            "canvas_image": f"data:image/png;base64,{b64}",
+            "ratios":       ratios,
+            "analysis":     analysis
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 
@@ -985,87 +1347,126 @@ def list_tutorials():
 
 @app.websocket("/ws/realtime-grid")
 async def websocket_realtime_grid(websocket: WebSocket):
-    """WebSocket endpoint for real-time 3D adaptive grid"""
     await websocket.accept()
-    print("WebSocket connected for real-time grid")  # ← Remove emoji
-    
-    frame_count = 0
-    
+    print("WebSocket connected")
+    frame_count    = 0
+    send_annotated = True  # default: grid on
+    import asyncio
+    import json
+
     try:
         while True:
             try:
-                # Receive frame from frontend
-                data = await websocket.receive_bytes()
+                message = await asyncio.wait_for(
+                    websocket.receive(),
+                    timeout=10.0
+                )
+
+                # ── Handle text messages (grid toggle from frontend) ──
+                if "text" in message:
+                    try:
+                        text_data = json.loads(message["text"])
+                        if "grid" in text_data:
+                            send_annotated = bool(text_data["grid"])
+                            print(f"Grid annotation: {'ON' if send_annotated else 'OFF'}")
+                    except:
+                        pass
+                    await websocket.send_json({"status": "ping"})
+                    continue
+
+                if "bytes" not in message or message["bytes"] is None:
+                    continue
+
+                data = message["bytes"]
                 frame_count += 1
-                
-                print(f"Frame {frame_count} received: {len(data)} bytes")  # ← Remove emoji
-                
-                # Decode image
+
                 nparr = np.frombuffer(data, np.uint8)
-                img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-                
+                img   = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
                 if img is None:
-                    print(f"Frame {frame_count}: Failed to decode image")  # ← Remove emoji
                     await websocket.send_json({"status": "invalid_frame"})
                     continue
-                
+
+                # Resize to fixed width for consistent processing
+                target_w = 640
+                h, w     = img.shape[:2]
+                scale    = target_w / w
+                img      = cv2.resize(img, (target_w, int(h * scale)))
                 height, width = img.shape[:2]
-                print(f"Frame {frame_count}: Decoded {width}x{height}")  # ← Remove emoji
-                
-                rgb_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                
-                # Process with MediaPipe
-                face_results = face_mesh.process(rgb_img)
-                
+
+                rgb_img      = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                face_results = face_mesh_video.process(rgb_img)
+
                 if face_results.multi_face_landmarks:
                     face_landmarks = face_results.multi_face_landmarks[0].landmark
-                    
-                    # Calculate 3D head pose
                     head_pose = calculate_head_pose(face_landmarks, width, height)
-                    
-                    if head_pose:
-                        # Generate adaptive 3D grid
-                        grid_3d = generate_adaptive_3d_grid(face_landmarks, head_pose, width, height)
-                        
-                        # Classify view type
-                        view_type = classify_face_view(head_pose['yaw'], head_pose['pitch'])
-                        
-                        print(f"Frame {frame_count}: Grid generated (yaw={head_pose['yaw']}, pitch={head_pose['pitch']})")  # ← Remove emoji
-                        
-                        # Send response
-                        await websocket.send_json({
-                            "status": "success",
-                            "grid": grid_3d,
-                            "pose": head_pose,
-                            "view_type": view_type,
-                            "timestamp": datetime.now().isoformat()
-                        })
-                    else:
-                        print(f"Frame {frame_count}: Pose calculation failed")  # ← Remove emoji
-                        await websocket.send_json({"status": "pose_failed"})
-                else:
-                    print(f"Frame {frame_count}: No face detected")  # ← Remove emoji
-                    await websocket.send_json({"status": "no_face"})
-                    
-            except Exception as frame_error:
-                print(f"Frame {frame_count} error: {frame_error}")  # ← Remove emoji
-                import traceback
-                traceback.print_exc()
-                await websocket.send_json({"status": "error", "message": str(frame_error)})
-                
-    except Exception as e:
-        print(f"WebSocket fatal error: {e}")  # ← Remove emoji
-        import traceback
-        traceback.print_exc()
-    finally:
-        # Check if already closed before attempting to close
-        if websocket.client_state.name != "DISCONNECTED":
-            try:
-                await websocket.close()
-            except:
-                pass
-        print(f"WebSocket disconnected (processed {frame_count} frames)")  # ← Remove emoji
+                    view_type = classify_face_view(
+                        head_pose['yaw'], head_pose['pitch']
+                    ) if head_pose else "Unknown"
 
+                    # ── Compute measurements and ratios ───────────────
+                    face_ratios = compute_face_ratios(face_landmarks, width, height)
+                    analysis    = analyze_proportions_vs_ideal(face_ratios) if face_ratios else None
+
+                    # ── Grid ON: draw annotation, heavier ────────────
+                    if send_annotated:
+                        annotated = img.copy()
+                        annotated = draw_loomis_grid(annotated, face_landmarks, 0)
+                        _, buffer = cv2.imencode(
+                            '.jpg', annotated,
+                            [cv2.IMWRITE_JPEG_QUALITY, 75]
+                        )
+                    # ── Grid OFF: raw frame only, much faster ─────────
+                    else:
+                        _, buffer = cv2.imencode(
+                            '.jpg', img,
+                            [cv2.IMWRITE_JPEG_QUALITY, 75]
+                        )
+
+                    b64_frame = base64.b64encode(buffer).decode('utf-8')
+
+                    await websocket.send_json({
+                        "status":       "success",
+                        "frame":        b64_frame,
+                        "pose":         head_pose,
+                        "view_type":    view_type,
+                        "measurements": face_ratios["measurements_px"]    if face_ratios else None,
+                        "ratios":       face_ratios["proportional_ratios"] if face_ratios else None,
+                        "analysis":     analysis,
+                        "timestamp":    datetime.now().isoformat()
+                    })
+
+                else:
+                    # No face — always send raw frame
+                    _, buffer = cv2.imencode(
+                        '.jpg', img,
+                        [cv2.IMWRITE_JPEG_QUALITY, 75]
+                    )
+                    b64_frame = base64.b64encode(buffer).decode('utf-8')
+                    await websocket.send_json({
+                        "status": "no_face",
+                        "frame":  b64_frame
+                    })
+
+            except asyncio.TimeoutError:
+                try:
+                    await websocket.send_json({"status": "ping"})
+                except:
+                    break
+            except Exception as frame_error:
+                print(f"Frame {frame_count} error: {frame_error}")
+                try:
+                    await websocket.send_json({
+                        "status":  "error",
+                        "message": str(frame_error)
+                    })
+                except:
+                    break
+
+    except Exception as e:
+        print(f"WebSocket fatal: {e}")
+    finally:
+        print(f"WebSocket closed after {frame_count} frames")
 
 
 # ========== NEW: Fast Processing Endpoint (Alternative to WebSocket) ==========
