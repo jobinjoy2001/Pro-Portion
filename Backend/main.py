@@ -9,8 +9,11 @@ import math
 import os
 from datetime import datetime
 from sklearn.svm import SVR
+from fastapi import WebSocketDisconnect
 import joblib
 import base64
+import asyncio
+import json
 
 
 app = FastAPI(title="Pro-Portion Backend v1.1 - Tutorial + ML")
@@ -108,30 +111,40 @@ def calculate_distance(landmark1, landmark2, img_width, img_height):
 
 def compute_face_ratios(landmarks, img_width, img_height):
     try:
-        eye_distance = calculate_distance(landmarks[33], landmarks[362], img_width, img_height)
-        nose_to_chin = calculate_distance(landmarks[1], landmarks[152], img_width, img_height)
-        face_width = calculate_distance(landmarks[234], landmarks[454], img_width, img_height)
-        forehead_to_chin = calculate_distance(landmarks[10], landmarks[152], img_width, img_height)
-        
-        # Additional measurements
-        mouth_width = calculate_distance(landmarks[61], landmarks[291], img_width, img_height)
-        nose_width = calculate_distance(landmarks[48], landmarks[278], img_width, img_height)
-        
+        eye_distance     = calculate_distance(landmarks[33],  landmarks[362], img_width, img_height)
+        nose_to_chin     = calculate_distance(landmarks[1],   landmarks[152], img_width, img_height)
+        face_width       = calculate_distance(landmarks[234], landmarks[454], img_width, img_height)
+        forehead_to_chin = calculate_distance(landmarks[10],  landmarks[152], img_width, img_height)
+        mouth_width      = calculate_distance(landmarks[61],  landmarks[291], img_width, img_height)
+        nose_width       = calculate_distance(landmarks[48],  landmarks[278], img_width, img_height)
+
+        # ── NEW: jaw, forehead, cheekbone for accurate shape detection ──
+        jaw_width        = calculate_distance(landmarks[172], landmarks[397], img_width, img_height)
+        forehead_width   = calculate_distance(landmarks[70],  landmarks[300], img_width, img_height)
+        cheekbone_width  = calculate_distance(landmarks[123], landmarks[352], img_width, img_height)
+
         return {
             "measurements_px": {
-                "eye_distance": round(eye_distance, 2),
-                "nose_to_chin": round(nose_to_chin, 2),
-                "face_width": round(face_width, 2),
-                "face_height": round(forehead_to_chin, 2),
-                "mouth_width": round(mouth_width, 2),
-                "nose_width": round(nose_width, 2)
+                "eye_distance":    round(eye_distance, 2),
+                "nose_to_chin":    round(nose_to_chin, 2),
+                "face_width":      round(face_width, 2),
+                "face_height":     round(forehead_to_chin, 2),
+                "mouth_width":     round(mouth_width, 2),
+                "nose_width":      round(nose_width, 2),
+                "jaw_width":       round(jaw_width, 2),
+                "forehead_width":  round(forehead_width, 2),
+                "cheekbone_width": round(cheekbone_width, 2),
             },
             "proportional_ratios": {
-                "eye_to_face_width": round(eye_distance / face_width, 3) if face_width > 0 else 0,
-                "nose_to_face_height": round(nose_to_chin / forehead_to_chin, 3) if forehead_to_chin > 0 else 0,
-                "face_aspect_ratio": round(face_width / forehead_to_chin, 3) if forehead_to_chin > 0 else 0,
-                "mouth_to_face_width": round(mouth_width / face_width, 3) if face_width > 0 else 0,
-                "nose_to_face_width": round(nose_width / face_width, 3) if face_width > 0 else 0
+                "eye_to_face_width":   round(eye_distance    / face_width,       3) if face_width       > 0 else 0,
+                "nose_to_face_height": round(nose_to_chin    / forehead_to_chin, 3) if forehead_to_chin > 0 else 0,
+                "face_aspect_ratio":   round(face_width      / forehead_to_chin, 3) if forehead_to_chin > 0 else 0,
+                "mouth_to_face_width": round(mouth_width     / face_width,       3) if face_width       > 0 else 0,
+                "nose_to_face_width":  round(nose_width      / face_width,       3) if face_width       > 0 else 0,
+                # NEW — shape classification ratios
+                "jaw_to_face_width":   round(jaw_width        / face_width,       3) if face_width       > 0 else 0,
+                "forehead_to_jaw":     round(forehead_width   / jaw_width,        3) if jaw_width        > 0 else 0,
+                "cheekbone_to_jaw":    round(cheekbone_width  / jaw_width,        3) if jaw_width        > 0 else 0,
             }
         }
     except Exception as e:
@@ -139,25 +152,34 @@ def compute_face_ratios(landmarks, img_width, img_height):
         return None
 
 
+
 def analyze_proportions_vs_ideal(ratios):
     """Compare detected ratios with classical ideal proportions"""
     if not ratios:
         return None
-    
+
     detected = ratios["proportional_ratios"]
-    
+
+    # DEBUG: show the numbers for this face in the terminal
+    print(
+        "aspect=", detected.get("face_aspect_ratio", 0),
+        "jaw/face=", detected.get("jaw_to_face_width", 0),
+        "forehead/jaw=", detected.get("forehead_to_jaw", 0),
+        "cheekbone/jaw=", detected.get("cheekbone_to_jaw", 0),
+        "mouth/face=", detected.get("mouth_to_face_width", 0),
+    )
+
     analysis = {
         "overall_score": 0,
         "comparisons": {},
         "recommendations": []
     }
-    
-    # Compare each ratio
+
     scores = []
-    
+
     # Eye spacing
     eye_diff = abs(detected["eye_to_face_width"] - IDEAL_PROPORTIONS["eye_to_face_width"])
-    eye_score = max(0, 100 - (eye_diff * 200))  # Convert to 0-100 scale
+    eye_score = max(0, 100 - (eye_diff * 200))
     scores.append(eye_score)
     analysis["comparisons"]["eye_spacing"] = {
         "detected": detected["eye_to_face_width"],
@@ -170,7 +192,7 @@ def analyze_proportions_vs_ideal(ratios):
             analysis["recommendations"].append("Eyes are slightly wider-set than classical proportions")
         else:
             analysis["recommendations"].append("Eyes are slightly closer-set than classical proportions")
-    
+
     # Nose-chin ratio
     nose_diff = abs(detected["nose_to_face_height"] - IDEAL_PROPORTIONS["nose_to_face_height"])
     nose_score = max(0, 100 - (nose_diff * 200))
@@ -186,7 +208,7 @@ def analyze_proportions_vs_ideal(ratios):
             analysis["recommendations"].append("Lower face is longer than classical thirds")
         else:
             analysis["recommendations"].append("Lower face is shorter than classical thirds")
-    
+
     # Face aspect ratio
     aspect_diff = abs(detected["face_aspect_ratio"] - IDEAL_PROPORTIONS["face_aspect_ratio"])
     aspect_score = max(0, 100 - (aspect_diff * 150))
@@ -202,23 +224,135 @@ def analyze_proportions_vs_ideal(ratios):
             analysis["recommendations"].append("Face is wider than classical oval proportions")
         else:
             analysis["recommendations"].append("Face is narrower/longer than classical oval proportions")
-    
+
     # Calculate overall score
     analysis["overall_score"] = round(sum(scores) / len(scores), 1)
-    
-    # Face shape classification
-    aspect = detected["face_aspect_ratio"]
-    if aspect > 0.85:
-        analysis["face_shape"] = "Round/Square"
-    elif aspect < 0.65:
-        analysis["face_shape"] = "Oblong/Long"
-    else:
-        analysis["face_shape"] = "Oval/Balanced"
-    
-    if not analysis["recommendations"]:
-        analysis["recommendations"].append("Proportions closely match classical ideal!")
-    
+
+    # ── Improved face shape classification ────────────────────────────
+    aspect        = detected.get("face_aspect_ratio", 0)
+    jaw_ratio     = detected.get("jaw_to_face_width", 0)
+    forehead_jaw  = detected.get("forehead_to_jaw", 0)
+    cheekbone_jaw = detected.get("cheekbone_to_jaw", 0)
+    mouth_ratio   = detected.get("mouth_to_face_width", 0)
+
+    # Prototypes based on your labeled examples
+    prototypes = {
+        "Round": {
+            "aspect": 0.957,
+            "jaw": 0.806,
+            "forehead": 0.970,
+            "cheekbone": 1.082,
+            "mouth": 0.331
+        },
+        "Square": {
+            "aspect": 0.844,
+            "jaw": 0.826,
+            "forehead": 1.018,
+            "cheekbone": 1.076,
+            "mouth": 0.332
+        },
+        "Oval/Balanced": {
+            "aspect": 0.827,
+            "jaw": 0.770,
+            "forehead": 1.123,
+            "cheekbone": 1.164,
+            "mouth": 0.385
+        },
+        "Heart": {
+            "aspect": 0.821,
+            "jaw": 0.760,
+            "forehead": 1.100,
+            "cheekbone": 1.154,
+            "mouth": 0.356
+        },
+        "Oblong/Long": {
+            "aspect": 0.775,
+            "jaw": 0.809,
+            "forehead": 1.041,
+            "cheekbone": 1.099,
+            "mouth": 0.341
+        },
+        "Diamond": {
+            "aspect": 0.880,
+            "jaw": 0.814,
+            "forehead": 1.026,
+            "cheekbone": 1.099,
+            "mouth": 0.356
+        },
+        "Triangle": {
+            "aspect": 0.878,
+            "jaw": 0.776,
+            "forehead": 1.063,
+            "cheekbone": 1.147,
+            "mouth": 0.368
+        }
+    }
+
+    weights = {
+        "aspect": 2.8,
+        "jaw": 2.4,
+        "forehead": 2.0,
+        "cheekbone": 1.8,
+        "mouth": 0.8
+    }
+
+    def shape_distance(p):
+        return math.sqrt(
+            weights["aspect"]    * (aspect - p["aspect"]) ** 2 +
+            weights["jaw"]       * (jaw_ratio - p["jaw"]) ** 2 +
+            weights["forehead"]  * (forehead_jaw - p["forehead"]) ** 2 +
+            weights["cheekbone"] * (cheekbone_jaw - p["cheekbone"]) ** 2 +
+            weights["mouth"]     * (mouth_ratio - p["mouth"]) ** 2
+        )
+
+    shape_scores = {shape: shape_distance(proto) for shape, proto in prototypes.items()}
+
+    # Tie-break / bias rules from observed patterns
+    if aspect >= 0.93:
+        shape_scores["Round"] *= 0.72
+        shape_scores["Square"] *= 1.08
+        shape_scores["Oblong/Long"] *= 1.20
+
+    if 0.83 <= aspect <= 0.87 and jaw_ratio >= 0.82 and abs(forehead_jaw - 1.0) <= 0.03:
+        shape_scores["Square"] *= 0.74
+
+    if aspect <= 0.80 and jaw_ratio >= 0.79 and forehead_jaw <= 1.06:
+        shape_scores["Oblong/Long"] *= 0.72
+
+    if cheekbone_jaw >= 1.13 and jaw_ratio <= 0.79 and forehead_jaw >= 1.09:
+        shape_scores["Heart"] *= 0.76
+
+    if cheekbone_jaw >= 1.13 and 1.05 <= forehead_jaw <= 1.09 and jaw_ratio <= 0.79:
+        shape_scores["Triangle"] *= 0.74
+
+    if cheekbone_jaw >= 1.14 and jaw_ratio <= 0.78 and forehead_jaw >= 1.10:
+        shape_scores["Oval/Balanced"] *= 0.82
+
+    if 0.86 <= aspect <= 0.90 and 0.80 <= jaw_ratio <= 0.82 and 1.00 <= forehead_jaw <= 1.04:
+        shape_scores["Diamond"] *= 0.72
+
+    if jaw_ratio >= 0.82 and forehead_jaw <= 1.03 and cheekbone_jaw <= 1.10:
+        shape_scores["Square"] *= 0.84
+
+    if forehead_jaw < 1.00 and jaw_ratio >= 0.79:
+        shape_scores["Triangle"] *= 0.86
+
+    ranked = sorted(shape_scores.items(), key=lambda x: x[1])
+    best_shape, best_score = ranked[0]
+    second_shape, second_score = ranked[1]
+
+    analysis["face_shape"] = best_shape
+    analysis["shape_scores"] = {k: round(v, 4) for k, v in sorted(shape_scores.items(), key=lambda x: x[1])}
+    analysis["shape_confidence"] = round(
+        max(0.0, min(100.0, (second_score - best_score) / max(second_score, 1e-6) * 100)),
+        1
+    )
+
+    print("Shape ranking:", analysis["shape_scores"])
+    print("Chosen shape :", analysis["face_shape"], f"(confidence={analysis['shape_confidence']}%)")
+
     return analysis
+
 
 
 def compute_body_ratios(landmarks, img_width, img_height):
@@ -523,10 +657,13 @@ def detect_face_roi(img):
     return best
 
 
-def draw_loomis_grid(img, face_landmarks, face_id):
+def draw_loomis_grid(img, face_landmarks, face_id, head_pose=None):
     """
-    Draw Loomis grid using DNN-detected face ROI for accurate placement.
-    MediaPipe landmarks are used for precise line positions within that ROI.
+    Safe backward-compatible Loomis grid drawer.
+
+    - If head_pose is None -> behaves like your existing frontal grid.
+    - If head_pose is provided and yaw is large -> draws a pose-aware grid.
+    - Does NOT affect tutorial/learn mode functions.
     """
     height, width = img.shape[:2]
 
@@ -534,75 +671,206 @@ def draw_loomis_grid(img, face_landmarks, face_id):
         def px(idx): return int(face_landmarks[idx].x * width)
         def py(idx): return int(face_landmarks[idx].y * height)
 
-        # ── Use DNN detector for tight accurate face bounds ──────────
+        colors = [
+            (0, 255, 0), (255, 0, 0), (0, 0, 255), (255, 255, 0),
+            (255, 0, 255), (0, 255, 255), (128, 255, 0), (255, 128, 0)
+        ]
+        color = colors[face_id % len(colors)]
+
+        # ── Face bounds: keep your current stable logic ───────────────
         roi = detect_face_roi(img)
 
         if roi:
             rx, ry, rw, rh = roi
-            x_left   = rx
-            x_right  = rx + rw
-            y_top    = ry
+            x_left = rx
+            x_right = rx + rw
+            y_top = ry
             y_bottom = ry + rh
         else:
-            # Fallback to MediaPipe oval if DNN misses
-            oval_ids = [10,338,297,332,284,251,389,356,454,323,361,288,
-                        397,365,379,378,400,377,152,148,176,149,150,136,
-                        172,58,132,93,234,127,162,21,54,103,67,109]
-            xs = [face_landmarks[i].x * width  for i in oval_ids]
+            oval_ids = [
+                10,338,297,332,284,251,389,356,454,323,361,288,
+                397,365,379,378,400,377,152,148,176,149,150,136,
+                172,58,132,93,234,127,162,21,54,103,67,109
+            ]
+            xs = [face_landmarks[i].x * width for i in oval_ids]
             ys = [face_landmarks[i].y * height for i in oval_ids]
-            x_left   = int(min(xs))
-            x_right  = int(max(xs))
-            y_top    = py(10)
+            x_left = int(min(xs))
+            x_right = int(max(xs))
+            y_top = py(10)
             y_bottom = py(152)
 
-        x_center = (x_left + x_right) // 2
-        face_h   = y_bottom - y_top
-        face_w   = x_right  - x_left
+        face_w = max(1, x_right - x_left)
+        face_h = max(1, y_bottom - y_top)
 
-        # ── MediaPipe for precise horizontal line positions ───────────
-        y_brow   = (py(70)  + py(300)) // 2
-        y_eye    = (py(33)  + py(263)) // 2
-        y_nose   = py(94)
-        y_mouth  = (py(61)  + py(291)) // 2
+        y_brow = (py(70) + py(300)) // 2
+        y_eye = (py(33) + py(263)) // 2
+        y_nose = py(94)
+        y_mouth = (py(61) + py(291)) // 2
 
-        colors = [(0,255,0),(255,0,0),(0,0,255),(255,255,0),
-                  (255,0,255),(0,255,255),(128,255,0),(255,128,0)]
-        color = colors[face_id % len(colors)]
-
-        # ── Draw bounding box ─────────────────────────────────────────
-        cv2.rectangle(img, (x_left, y_top), (x_right, y_bottom), color, 2)
-
-        # ── Vertical center line ──────────────────────────────────────
-        cv2.line(img, (x_center, y_top), (x_center, y_bottom),
-                 (255, 0, 255), 2, cv2.LINE_AA)
-
-        # ── Horizontal proportion lines ───────────────────────────────
-        lines = [
-            (y_brow,  (0, 215, 255), "Eyebrow"),
-            (y_eye,   (0, 255, 255), "Eye Line"),
-            (y_nose,  (0, 165, 255), "Nose"),
-            (y_mouth, (203,192,255), "Mouth"),
-        ]
-        for y, c, label in lines:
-            # Only draw if y is within the detected face bounds
-            if y_top <= y <= y_bottom:
-                cv2.line(img, (x_left, y), (x_right, y), c, 1, cv2.LINE_AA)
-                cv2.putText(img, label, (x_right + 5, y + 5),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, c, 1, cv2.LINE_AA)
-
-        # ── Measurements ─────────────────────────────────────────────
         PX_TO_CM = 0.0264
-        cv2.putText(img, f"W:{face_w}px ({face_w*PX_TO_CM:.1f}cm)",
-                    (x_left, y_bottom + 18),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255,255,255), 1, cv2.LINE_AA)
-        cv2.putText(img, f"H:{face_h}px ({face_h*PX_TO_CM:.1f}cm)",
-                    (max(0, x_left - 95), (y_top + y_bottom)//2),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255,255,255), 1, cv2.LINE_AA)
 
-        # ── Face label ────────────────────────────────────────────────
-        cv2.putText(img, f"Face {face_id+1}",
-                    (x_left, max(15, y_top - 10)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
+        # ── Default old behavior if no pose is passed ────────────────
+        if not head_pose:
+            x_center = (x_left + x_right) // 2
+
+            cv2.rectangle(img, (x_left, y_top), (x_right, y_bottom), color, 2)
+
+            cv2.line(
+                img, (x_center, y_top), (x_center, y_bottom),
+                (255, 0, 255), 2, cv2.LINE_AA
+            )
+
+            lines = [
+                (y_brow,  (0, 215, 255), "Eyebrow"),
+                (y_eye,   (0, 255, 255), "Eye Line"),
+                (y_nose,  (0, 165, 255), "Nose"),
+                (y_mouth, (203, 192, 255), "Mouth"),
+            ]
+            for y, c, label in lines:
+                if y_top <= y <= y_bottom:
+                    cv2.line(img, (x_left, y), (x_right, y), c, 1, cv2.LINE_AA)
+                    cv2.putText(
+                        img, label, (x_right + 5, y + 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, c, 1, cv2.LINE_AA
+                    )
+
+            cv2.putText(
+                img, f"W:{face_w}px ({face_w * PX_TO_CM:.1f}cm)",
+                (x_left, min(height - 8, y_bottom + 18)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA
+            )
+            cv2.putText(
+                img, f"H:{face_h}px ({face_h * PX_TO_CM:.1f}cm)",
+                (max(0, x_left - 95), (y_top + y_bottom) // 2),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA
+            )
+            cv2.putText(
+                img, f"Face {face_id + 1}",
+                (x_left, max(15, y_top - 10)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA
+            )
+            return img
+
+        # ── Pose-aware branch for realtime only ───────────────────────
+        yaw = float(head_pose.get("yaw", 0.0))
+        pitch = float(head_pose.get("pitch", 0.0))
+        abs_yaw = abs(yaw)
+
+        # Near-frontal: preserve legacy look
+        if abs_yaw < 15:
+            x_center = (x_left + x_right) // 2
+
+            cv2.rectangle(img, (x_left, y_top), (x_right, y_bottom), color, 2)
+
+            cv2.line(
+                img, (x_center, y_top), (x_center, y_bottom),
+                (255, 0, 255), 2, cv2.LINE_AA
+            )
+
+            lines = [
+                (y_brow,  (0, 215, 255), "Eyebrow"),
+                (y_eye,   (0, 255, 255), "Eye Line"),
+                (y_nose,  (0, 165, 255), "Nose"),
+                (y_mouth, (203, 192, 255), "Mouth"),
+            ]
+            for y, c, label in lines:
+                if y_top <= y <= y_bottom:
+                    cv2.line(img, (x_left, y), (x_right, y), c, 1, cv2.LINE_AA)
+                    cv2.putText(
+                        img, label, (x_right + 5, y + 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, c, 1, cv2.LINE_AA
+                    )
+        else:
+            # Direction-aware center shift
+            direction = -1 if yaw < 0 else 1
+
+            nose_x = px(1)
+            chin_x = px(152)
+            brow_mid_x = (px(70) + px(300)) // 2
+            center_anchor = int((nose_x * 0.45) + (chin_x * 0.20) + (brow_mid_x * 0.35))
+
+            # Perspective compression on the far side
+            shift_ratio = min(abs_yaw / 60.0, 1.0) * 0.18
+            near_scale = 1.0
+            far_scale = 1.0 - min(abs_yaw / 70.0, 0.35)
+
+            if direction > 0:  # looking right
+                left_span = face_w * 0.50 * near_scale
+                right_span = face_w * 0.50 * far_scale
+            else:              # looking left
+                left_span = face_w * 0.50 * far_scale
+                right_span = face_w * 0.50 * near_scale
+
+            x_center = int(center_anchor + direction * face_w * shift_ratio)
+            left_edge = max(0, int(x_center - left_span))
+            right_edge = min(width - 1, int(x_center + right_span))
+
+            # Slight pitch compensation for top/bottom
+            pitch_shift = int((pitch / 45.0) * face_h * 0.08)
+            top_adj = max(0, y_top - max(0, -pitch_shift))
+            bottom_adj = min(height - 1, y_bottom + max(0, pitch_shift))
+
+            # Outer bounds
+            cv2.rectangle(img, (left_edge, top_adj), (right_edge, bottom_adj), color, 2)
+
+            # Center axis
+            cv2.line(
+                img, (x_center, top_adj), (x_center, bottom_adj),
+                (255, 0, 255), 2, cv2.LINE_AA
+            )
+
+            # Horizontal lines taper slightly toward far side for 3/4 feel
+            taper = int(face_w * min(abs_yaw / 70.0, 0.18))
+            if direction > 0:
+                line_left = left_edge
+                line_right = max(left_edge + 10, right_edge - taper)
+            else:
+                line_left = min(right_edge - 10, left_edge + taper)
+                line_right = right_edge
+
+            lines = [
+                (y_brow,  (0, 215, 255), "Eyebrow"),
+                (y_eye,   (0, 255, 255), "Eye Line"),
+                (y_nose,  (0, 165, 255), "Nose"),
+                (y_mouth, (203, 192, 255), "Mouth"),
+            ]
+            for y, c, label in lines:
+                if top_adj <= y <= bottom_adj:
+                    cv2.line(img, (line_left, y), (line_right, y), c, 1, cv2.LINE_AA)
+                    cv2.putText(
+                        img, label, (min(width - 120, right_edge + 5), y + 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, c, 1, cv2.LINE_AA
+                    )
+
+            x_left = left_edge
+            x_right = right_edge
+            y_top = top_adj
+            y_bottom = bottom_adj
+            face_w = max(1, x_right - x_left)
+            face_h = max(1, y_bottom - y_top)
+
+        cv2.putText(
+            img, f"W:{face_w}px ({face_w * PX_TO_CM:.1f}cm)",
+            (x_left, min(height - 8, y_bottom + 18)),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA
+        )
+        cv2.putText(
+            img, f"H:{face_h}px ({face_h * PX_TO_CM:.1f}cm)",
+            (max(0, x_left - 95), (y_top + y_bottom) // 2),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA
+        )
+
+        pose_label = "Front"
+        if abs_yaw >= 15 and abs_yaw < 35:
+            pose_label = "3/4"
+        elif abs_yaw >= 35:
+            pose_label = "Profile"
+
+        cv2.putText(
+            img, f"Face {face_id + 1} | {pose_label}",
+            (x_left, max(15, y_top - 10)),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA
+        )
 
     except Exception as e:
         print(f"draw_loomis_grid error: {e}")
@@ -933,23 +1201,24 @@ def calculate_head_pose(face_landmarks, img_width, img_height):
 
 
 def classify_face_view(yaw, pitch):
-    """Classify the face view type based on angles"""
     abs_yaw = abs(yaw)
     abs_pitch = abs(pitch)
-    
-    if abs_yaw < 12:
-        return "Front View"
-    elif 12 <= abs_yaw < 40:
-        direction = "Left" if yaw < 0 else "Right"
-        return f"3/4 View ({direction})"
-    elif 40 <= abs_yaw < 75:
-        direction = "Left" if yaw < 0 else "Right"
-        return f"Profile ({direction})"
-    elif abs_pitch > 25:
+
+    if abs_pitch >= 22 and abs_yaw < 20:
         direction = "Up" if pitch < 0 else "Down"
         return f"Tilted {direction}"
+
+    if abs_yaw < 15:
+        return "Front View"
+    elif abs_yaw < 35:
+        direction = "Left" if yaw < 0 else "Right"
+        return f"3/4 View ({direction})"
+    elif abs_yaw < 65:
+        direction = "Left" if yaw < 0 else "Right"
+        return f"Profile ({direction})"
     else:
-        return "Angled View"
+        direction = "Left" if yaw < 0 else "Right"
+        return f"Extreme Profile ({direction})"
 
 
 def generate_adaptive_3d_grid(face_landmarks, head_pose, img_width, img_height):
@@ -1078,34 +1347,45 @@ def health_check():
 @app.post("/process-tutorial")
 async def process_tutorial(file: UploadFile = File(...)):
     """Generate step-by-step Loomis grid tutorial with measurements"""
-    if not file.content_type.startswith('image/'):
-        raise HTTPException(status_code=400, detail="Only images allowed")
-    
+
+    # ── Universal image decode (JPG, PNG, WEBP, BMP, TIFF, HEIC, etc.) ──
     contents = await file.read()
+
     nparr = np.frombuffer(contents, np.uint8)
-    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-    
+    img   = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
     if img is None:
-        raise HTTPException(status_code=400, detail="Invalid image")
-    
+        try:
+            from PIL import Image
+            import io
+            pil_img = Image.open(io.BytesIO(contents)).convert("RGB")
+            img     = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Unsupported or corrupt image format")
+
+    if img is None:
+        raise HTTPException(status_code=400, detail="Could not decode image")
+
     height, width = img.shape[:2]
     print(f"\n{'='*60}")
     print(f"TUTORIAL MODE: {file.filename}")
     print(f"Dimensions: {width}x{height}")
-    
-    rgb_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+    rgb_img      = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     face_results = face_mesh.process(rgb_img)
-    
+
     if not face_results.multi_face_landmarks:
-        raise HTTPException(status_code=400, detail="No faces detected. Use clear, front-facing photo with good lighting.")
-    
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        raise HTTPException(
+            status_code=400,
+            detail="No faces detected. Use a clear, front-facing photo with good lighting."
+        )
+
+    timestamp       = datetime.now().strftime("%Y%m%d_%H%M%S")
     tutorial_images = []
-    
+
     # Process first face only for tutorial
     face_landmarks = face_results.multi_face_landmarks[0].landmark
-    
-    # Generate 6 tutorial steps
+
     step_descriptions = [
         "Face bounding box - establishes overall proportions",
         "Vertical centerline - facial symmetry axis",
@@ -1114,162 +1394,178 @@ async def process_tutorial(file: UploadFile = File(...)):
         "Face outline - jaw and cheek contours",
         "Complete Loomis grid - all construction lines"
     ]
-    
+
     for step in range(1, 7):
-        step_img = draw_tutorial_step(img, face_landmarks, 0, step, width, height)
-        
+        step_img      = draw_tutorial_step(img, face_landmarks, 0, step, width, height)
         step_filename = f"tutorial_step{step}_{timestamp}.jpg"
-        step_path = os.path.join(TUTORIAL_DIR, step_filename)
+        step_path     = os.path.join(TUTORIAL_DIR, step_filename)
         cv2.imwrite(step_path, step_img, [cv2.IMWRITE_JPEG_QUALITY, 95])
-        
+
         tutorial_images.append({
-            "step": step,
+            "step":        step,
             "description": step_descriptions[step - 1],
-            "filename": step_filename
+            "filename":    step_filename
         })
         print(f"[OK] Step {step}: {step_descriptions[step - 1]}")
-    
-    # Calculate proportions and ML analysis
+
+    # ── Proportions + improved face shape analysis ───────────────────
     face_ratios = compute_face_ratios(face_landmarks, width, height)
+    if face_ratios is None:
+        raise HTTPException(status_code=500, detail="Failed to compute face ratios")
+
     analysis = analyze_proportions_vs_ideal(face_ratios)
-    
-    print(f"ML Analysis Score: {analysis['overall_score']:.1f}/100")
-    print(f"Face Shape: {analysis['face_shape']}")
+    if analysis is None:
+        raise HTTPException(status_code=500, detail="Failed to analyze proportions")
+
+    print(f"ML Analysis Score : {analysis['overall_score']:.1f}/100")
+    print(f"Face Shape        : {analysis['face_shape']}")
+    print(f"Jaw/Face ratio    : {face_ratios['proportional_ratios'].get('jaw_to_face_width', 'N/A')}")
+    print(f"Forehead/Jaw ratio: {face_ratios['proportional_ratios'].get('forehead_to_jaw', 'N/A')}")
     print(f"{'='*60}\n")
-    
-    # Format tutorial steps for frontend (TutorialStep interface)
-    tutorial_steps_formatted = []
-    for step_data in tutorial_images:
-        # Split description to get just the title part
-        title_part = step_data['description'].split(' - ')[0]
-        tutorial_steps_formatted.append({
-            "title": f"Step {step_data['step']}: {title_part}",
-            "filename": step_data['filename']
-        })
-    
-    # Build face data object matching ProcessResult structure
+
+    # ── Format tutorial steps for frontend ──────────────────────────
+    tutorial_steps_formatted = [
+        {
+            "title":    f"Step {s['step']}: {s['description'].split(' - ')[0]}",
+            "filename": s["filename"]
+        }
+        for s in tutorial_images
+    ]
+
+    # ── Build face data matching ProcessResult structure ─────────────
     face_data = {
         "measurements_px": face_ratios.get("measurements_px", {}),
         "proportional_ratios": face_ratios.get("proportional_ratios", {}),
         "analysis": analysis
     }
-    
-    # Return response matching TutorialResult interface
+
     return {
-        "status": "success",
-        "filename": file.filename,
+        "status":         "success",
+        "filename":       file.filename,
         "tutorial_steps": tutorial_steps_formatted,
-        "face_count": 1,
-        "faces": [face_data]
+        "face_count":     1,
+        "faces":          [face_data]
     }
 
 
 @app.post("/process")
 async def process_image(file: UploadFile = File(...)):
     """Standard processing with Loomis grid and ML analysis"""
-    if not file.content_type.startswith('image/'):
-        raise HTTPException(status_code=400, detail="Only images allowed")
-    
+
+    # ── Universal image decode (JPG, PNG, WEBP, BMP, TIFF, HEIC, etc.) ──
     contents = await file.read()
+
     nparr = np.frombuffer(contents, np.uint8)
-    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-    
+    img   = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
     if img is None:
-        raise HTTPException(status_code=400, detail="Invalid image")
-    
+        try:
+            from PIL import Image
+            import io
+            pil_img = Image.open(io.BytesIO(contents)).convert("RGB")
+            img     = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Unsupported or corrupt image format")
+
+    if img is None:
+        raise HTTPException(status_code=400, detail="Could not decode image")
+
     height, width = img.shape[:2]
     print(f"\n{'='*50}")
     print(f"Processing: {file.filename}")
     print(f"Dimensions: {width}x{height}")
-    
+
     rgb_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    
-    # Face detection
+
+    # ── Face detection ───────────────────────────────────────────────
     basic_face_results = face_detection.process(rgb_img)
     if basic_face_results.detections:
         print(f"Basic detector: {len(basic_face_results.detections)} faces")
-    
+
     face_results = face_mesh.process(rgb_img)
     pose_results = pose.process(rgb_img)
-    
+
     annotated_img = img.copy()
-    
-    # Process faces
+
+    # ── Process faces ────────────────────────────────────────────────
     faces_data = []
     if face_results.multi_face_landmarks:
         num_faces = len(face_results.multi_face_landmarks)
         print(f"[OK] Face Mesh: {num_faces} faces")
-        
+
         for idx, face_landmarks_obj in enumerate(face_results.multi_face_landmarks):
             face_landmarks = face_landmarks_obj.landmark
-            
+
             # Draw Loomis grid
             annotated_img = draw_loomis_grid(annotated_img, face_landmarks, idx)
-            
+
             # Compute ratios and measurements
             face_ratios = compute_face_ratios(face_landmarks, width, height)
-            
+
             if face_ratios:
-                # Analyze proportions
                 analysis = analyze_proportions_vs_ideal(face_ratios)
-                
-                # Build face data object
-                face_data = {
-                    "measurements_px": face_ratios.get("measurements_px", {}),
-                    "proportional_ratios": face_ratios.get("proportional_ratios", {}),
-                    "analysis": analysis
-                }
-                
-                faces_data.append(face_data)
-                
-                print(f"Face {idx + 1}: Score={analysis['overall_score']:.1f}, Shape={analysis['face_shape']}")
+
+                if analysis:
+                    face_data = {
+                        "measurements_px":     face_ratios.get("measurements_px", {}),
+                        "proportional_ratios": face_ratios.get("proportional_ratios", {}),
+                        "analysis":            analysis
+                    }
+                    faces_data.append(face_data)
+
+                    print(f"Face {idx + 1}:")
+                    print(f"  Score          : {analysis['overall_score']:.1f}/100")
+                    print(f"  Shape          : {analysis['face_shape']}")
+                    print(f"  Jaw/Face       : {face_ratios['proportional_ratios'].get('jaw_to_face_width', 'N/A')}")
+                    print(f"  Forehead/Jaw   : {face_ratios['proportional_ratios'].get('forehead_to_jaw', 'N/A')}")
+                    print(f"  Cheekbone/Jaw  : {face_ratios['proportional_ratios'].get('cheekbone_to_jaw', 'N/A')}")
+                    print(f"  Aspect Ratio   : {face_ratios['proportional_ratios'].get('face_aspect_ratio', 'N/A')}")
     else:
         print("[X] No faces detected")
-    
-    # Process body (optional - can be added later)
+
+    # ── Process body (optional) ──────────────────────────────────────
     body_data = None
     if pose_results.pose_landmarks:
         print(f"[OK] Body detected")
         pose_landmarks = pose_results.pose_landmarks.landmark
-        body_ratios = compute_body_ratios(pose_landmarks, width, height)
-        
+        body_ratios    = compute_body_ratios(pose_landmarks, width, height)
+
         annotated_img = draw_pose_wireframe(annotated_img, pose_results.pose_landmarks)
-        
+
         if body_ratios:
             body_data = {
-                "detected": True,
-                "landmark_count": len(pose_landmarks),
-                "proportions": body_ratios
+                "detected":        True,
+                "landmark_count":  len(pose_landmarks),
+                "proportions":     body_ratios
             }
-    
-    # Save annotated image
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    # ── Save annotated image ─────────────────────────────────────────
+    timestamp       = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_filename = f"processed_{timestamp}.jpg"
-    output_path = os.path.join(OUTPUT_DIR, output_filename)
-    
+    output_path     = os.path.join(OUTPUT_DIR, output_filename)
+
     cv2.imwrite(output_path, annotated_img, [cv2.IMWRITE_JPEG_QUALITY, 95])
     print(f"Saved: {output_path}")
-    
-    # Encode image to base64 for frontend
-    _, buffer = cv2.imencode('.jpg', annotated_img, [cv2.IMWRITE_JPEG_QUALITY, 95])
-    img_base64 = base64.b64encode(buffer).decode('utf-8')
-    
+
+    # ── Encode to base64 for frontend ────────────────────────────────
+    _, buffer    = cv2.imencode('.jpg', annotated_img, [cv2.IMWRITE_JPEG_QUALITY, 95])
+    img_base64   = base64.b64encode(buffer).decode('utf-8')
+
     print(f"{'='*50}\n")
-    
-    # Build response matching frontend interface
+
+    # ── Build response ───────────────────────────────────────────────
     response = {
-        "status": "success" if faces_data else "no_face",
-        "face_count": len(faces_data),
-        "faces": faces_data,
-        "processed_image": img_base64,  # Base64 encoded image
-        "processed_image_url": f"/download/{output_filename}",  # Download URL
-        "timestamp": timestamp
+        "status":                "success" if faces_data else "no_face",
+        "face_count":            len(faces_data),
+        "faces":                 faces_data,
+        "processed_image":       img_base64,
+        "processed_image_url":   f"/download/{output_filename}",
+        "timestamp":             timestamp
     }
-    
-    # Add body analysis if detected
+
     if body_data:
         response["body_analysis"] = body_data
-    
+
     return response
 
 
@@ -1349,124 +1645,143 @@ def list_tutorials():
 async def websocket_realtime_grid(websocket: WebSocket):
     await websocket.accept()
     print("WebSocket connected")
-    frame_count    = 0
-    send_annotated = True  # default: grid on
-    import asyncio
-    import json
+
+    frame_count = 0
+    send_annotated = True
 
     try:
         while True:
             try:
-                message = await asyncio.wait_for(
-                    websocket.receive(),
-                    timeout=10.0
-                )
-
-                # ── Handle text messages (grid toggle from frontend) ──
-                if "text" in message:
-                    try:
-                        text_data = json.loads(message["text"])
-                        if "grid" in text_data:
-                            send_annotated = bool(text_data["grid"])
-                            print(f"Grid annotation: {'ON' if send_annotated else 'OFF'}")
-                    except:
-                        pass
+                message = await asyncio.wait_for(websocket.receive(), timeout=10.0)
+            except asyncio.TimeoutError:
+                try:
                     await websocket.send_json({"status": "ping"})
                     continue
+                except WebSocketDisconnect:
+                    break
+                except Exception:
+                    break
+            except WebSocketDisconnect:
+                break
+            except RuntimeError as e:
+                print(f"Frame {frame_count} error: {e}")
+                break
 
-                if "bytes" not in message or message["bytes"] is None:
-                    continue
+            if message.get("type") == "websocket.disconnect":
+                break
 
-                data = message["bytes"]
-                frame_count += 1
+            if "text" in message and message["text"] is not None:
+                try:
+                    text_data = json.loads(message["text"])
+                    if "grid" in text_data:
+                        send_annotated = bool(text_data["grid"])
+                        print(f"Grid annotation: {'ON' if send_annotated else 'OFF'}")
+                except Exception:
+                    pass
 
+                try:
+                    await websocket.send_json({"status": "ping"})
+                except WebSocketDisconnect:
+                    break
+                except Exception:
+                    break
+                continue
+
+            if "bytes" not in message or message["bytes"] is None:
+                continue
+
+            data = message["bytes"]
+            frame_count += 1
+
+            try:
                 nparr = np.frombuffer(data, np.uint8)
-                img   = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
                 if img is None:
                     await websocket.send_json({"status": "invalid_frame"})
                     continue
 
-                # Resize to fixed width for consistent processing
                 target_w = 640
-                h, w     = img.shape[:2]
-                scale    = target_w / w
-                img      = cv2.resize(img, (target_w, int(h * scale)))
+                h, w = img.shape[:2]
+                scale = target_w / w
+                img = cv2.resize(img, (target_w, int(h * scale)))
                 height, width = img.shape[:2]
 
-                rgb_img      = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                rgb_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
                 face_results = face_mesh_video.process(rgb_img)
 
-                if face_results.multi_face_landmarks:
-                    face_landmarks = face_results.multi_face_landmarks[0].landmark
-                    head_pose = calculate_head_pose(face_landmarks, width, height)
-                    view_type = classify_face_view(
-                        head_pose['yaw'], head_pose['pitch']
-                    ) if head_pose else "Unknown"
-
-                    # ── Compute measurements and ratios ───────────────
-                    face_ratios = compute_face_ratios(face_landmarks, width, height)
-                    analysis    = analyze_proportions_vs_ideal(face_ratios) if face_ratios else None
-
-                    # ── Grid ON: draw annotation, heavier ────────────
-                    if send_annotated:
-                        annotated = img.copy()
-                        annotated = draw_loomis_grid(annotated, face_landmarks, 0)
-                        _, buffer = cv2.imencode(
-                            '.jpg', annotated,
-                            [cv2.IMWRITE_JPEG_QUALITY, 75]
-                        )
-                    # ── Grid OFF: raw frame only, much faster ─────────
-                    else:
-                        _, buffer = cv2.imencode(
-                            '.jpg', img,
-                            [cv2.IMWRITE_JPEG_QUALITY, 75]
-                        )
-
-                    b64_frame = base64.b64encode(buffer).decode('utf-8')
-
-                    await websocket.send_json({
-                        "status":       "success",
-                        "frame":        b64_frame,
-                        "pose":         head_pose,
-                        "view_type":    view_type,
-                        "measurements": face_ratios["measurements_px"]    if face_ratios else None,
-                        "ratios":       face_ratios["proportional_ratios"] if face_ratios else None,
-                        "analysis":     analysis,
-                        "timestamp":    datetime.now().isoformat()
-                    })
-
-                else:
-                    # No face — always send raw frame
-                    _, buffer = cv2.imencode(
-                        '.jpg', img,
-                        [cv2.IMWRITE_JPEG_QUALITY, 75]
-                    )
-                    b64_frame = base64.b64encode(buffer).decode('utf-8')
+                if not face_results.multi_face_landmarks:
+                    _, buffer = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 75])
+                    b64_frame = base64.b64encode(buffer).decode("utf-8")
                     await websocket.send_json({
                         "status": "no_face",
-                        "frame":  b64_frame
+                        "frame": b64_frame
                     })
+                    continue
 
-            except asyncio.TimeoutError:
-                try:
-                    await websocket.send_json({"status": "ping"})
-                except:
-                    break
+                face_landmarks = face_results.multi_face_landmarks[0].landmark
+                head_pose = calculate_head_pose(face_landmarks, width, height)
+                view_type = classify_face_view(
+                    head_pose["yaw"], head_pose["pitch"]
+                ) if head_pose else "Unknown"
+
+                face_ratios = compute_face_ratios(face_landmarks, width, height)
+
+                analysis = None
+                if face_ratios and head_pose:
+                    if abs(head_pose["yaw"]) <= 15:
+                        analysis = analyze_proportions_vs_ideal(face_ratios)
+                    elif abs(head_pose["yaw"]) <= 35:
+                        analysis = analyze_proportions_vs_ideal(face_ratios)
+                        if analysis:
+                            analysis["face_shape"] = f"{analysis['face_shape']} (3/4 view)"
+                    else:
+                        analysis = {
+                            "overall_score": 0,
+                            "face_shape": "Profile view",
+                            "comparisons": {}
+                        }
+
+                if send_annotated:
+                    annotated = img.copy()
+                    annotated = draw_loomis_grid(annotated, face_landmarks, 0,head_pose)
+                    _, buffer = cv2.imencode('.jpg', annotated, [cv2.IMWRITE_JPEG_QUALITY, 75])
+                else:
+                    _, buffer = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 75])
+
+                b64_frame = base64.b64encode(buffer).decode("utf-8")
+
+                await websocket.send_json({
+                    "status": "success",
+                    "frame": b64_frame,
+                    "pose": head_pose,
+                    "view_type": view_type,
+                    "measurements": face_ratios["measurements_px"] if face_ratios else None,
+                    "ratios": face_ratios["proportional_ratios"] if face_ratios else None,
+                    "analysis": analysis,
+                    "timestamp": datetime.now().isoformat()
+                })
+
+            except WebSocketDisconnect:
+                break
+            except RuntimeError as e:
+                print(f"Frame {frame_count} error: {e}")
+                break
             except Exception as frame_error:
                 print(f"Frame {frame_count} error: {frame_error}")
                 try:
                     await websocket.send_json({
-                        "status":  "error",
+                        "status": "error",
                         "message": str(frame_error)
                     })
-                except:
+                except Exception:
                     break
 
     except Exception as e:
         print(f"WebSocket fatal: {e}")
     finally:
         print(f"WebSocket closed after {frame_count} frames")
+
 
 
 # ========== NEW: Fast Processing Endpoint (Alternative to WebSocket) ==========

@@ -59,8 +59,12 @@ const AnalysisDashboard = ({ result }: AnalysisDashboardProps) => {
           <div className="w-16 h-16 rounded-2xl bg-accent/10 flex items-center justify-center">
             <span className="text-2xl">
               {faceShape.includes("Oval") || faceShape.includes("Balanced") ? "🥚" :
-               faceShape.includes("Round") || faceShape.includes("Square") ? "🔵" :
-               faceShape.includes("Oblong") || faceShape.includes("Long") ? "📏" : "📐"}
+                faceShape.includes("Round") ? "🟠" :
+                faceShape.includes("Square") ? "🟦" :
+                faceShape.includes("Heart") ? "❤️" :
+                faceShape.includes("Diamond") ? "💎" :
+                faceShape.includes("Oblong") || faceShape.includes("Long") ? "📏" :
+                faceShape.includes("Triangle") ? "🔻" : "📐"}
             </span>
           </div>
           <div className="text-center">

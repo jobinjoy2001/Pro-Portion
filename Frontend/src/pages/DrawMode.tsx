@@ -8,38 +8,53 @@ import LiveInfoPanel from "@/components/LiveInfoPanel";
 import { createRealtimeWebSocket, RealtimeGridData } from "@/lib/api";
 
 const DrawMode = () => {
-  const webcamRef          = useRef<Webcam>(null);
-  const wsRef              = useRef<WebSocket | null>(null);
-  const animFrameRef       = useRef<number>(0);
-  const pingIntervalRef    = useRef<NodeJS.Timeout | null>(null);
-  const fpsCounterRef      = useRef({ frames: 0, lastTime: Date.now() });
-  const frameCountRef      = useRef(0);
-  const showGridRef        = useRef(true);
-  const isRunningRef       = useRef(false);
+  const webcamRef = useRef<Webcam>(null);
+  const wsRef = useRef<WebSocket | null>(null);
+  const animFrameRef = useRef<number>(0);
+  const pingIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const fpsCounterRef = useRef({ frames: 0, lastTime: Date.now() });
+  const frameCountRef = useRef(0);
+  const showGridRef = useRef(true);
+  const isRunningRef = useRef(false);
   const waitingResponseRef = useRef(false);
-  const lastSentTimeRef    = useRef(0);
+  const lastSentTimeRef = useRef(0);
 
-  const [isCameraOn, setIsCameraOn]           = useState(false);
-  const [showGrid, setShowGrid]               = useState(true);
-  const [isConnected, setIsConnected]         = useState(false);
-  const [gridData, setGridData]               = useState<RealtimeGridData | null>(null);
-  const [fps, setFps]                         = useState(0);
+  const [isCameraOn, setIsCameraOn] = useState(false);
+  const [showGrid, setShowGrid] = useState(true);
+  const [isConnected, setIsConnected] = useState(false);
+  const [gridData, setGridData] = useState<RealtimeGridData | null>(null);
+  const [fps, setFps] = useState(0);
   const [permissionError, setPermissionError] = useState(false);
-  const [annotatedFrame, setAnnotatedFrame]   = useState<string | null>(null);
+  const [annotatedFrame, setAnnotatedFrame] = useState<string | null>(null);
 
   const [poseData, setPoseData] = useState<{
-    pitch: number; yaw: number; roll: number; view_type: string;
+    pitch: number;
+    yaw: number;
+    roll: number;
+    view_type: string;
   } | null>(null);
 
   const [measurements, setMeasurements] = useState<{
-    face_width: number; face_height: number;
-    eye_distance: number; nose_to_chin: number;
-    mouth_width: number; nose_width: number;
+    face_width: number;
+    face_height: number;
+    eye_distance: number;
+    nose_to_chin: number;
+    mouth_width: number;
+    nose_width: number;
+    jaw_width?: number;
+    forehead_width?: number;
+    cheekbone_width?: number;
   } | null>(null);
 
   const [ratios, setRatios] = useState<{
-    eye_to_face_width: number; nose_to_face_height: number;
-    face_aspect_ratio: number; mouth_to_face_width: number;
+    eye_to_face_width: number;
+    nose_to_face_height: number;
+    face_aspect_ratio: number;
+    mouth_to_face_width: number;
+    nose_to_face_width?: number;
+    jaw_to_face_width?: number;
+    forehead_to_jaw?: number;
+    cheekbone_to_jaw?: number;
   } | null>(null);
 
   const [analysis, setAnalysis] = useState<{
@@ -48,23 +63,24 @@ const DrawMode = () => {
     comparisons: Record<string, { detected: number; ideal: number; score: number }>;
   } | null>(null);
 
-  // ── Keep showGridRef in sync + notify backend ───────────────────────
   useEffect(() => {
     showGridRef.current = showGrid;
     if (!showGrid) setAnnotatedFrame(null);
+
     if (wsRef.current?.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify({ grid: showGrid }));
     }
   }, [showGrid]);
 
-  // ── WebSocket ───────────────────────────────────────────────────────
   const connectWebSocket = useCallback(() => {
     try {
       const ws = createRealtimeWebSocket();
       wsRef.current = ws;
 
       const pingInterval = setInterval(() => {
-        if (ws.readyState === WebSocket.OPEN) console.log("WebSocket alive");
+        if (ws.readyState === WebSocket.OPEN) {
+          console.log("WebSocket alive");
+        }
       }, 30000);
       pingIntervalRef.current = pingInterval;
 
@@ -79,17 +95,29 @@ const DrawMode = () => {
           waitingResponseRef.current = false;
 
           const data: RealtimeGridData & {
-            frame?:        string;
-            pose?:         { pitch: number; yaw: number; roll: number };
-            view_type?:    string;
+            frame?: string;
+            pose?: { pitch: number; yaw: number; roll: number };
+            view_type?: string;
             measurements?: {
-              face_width: number; face_height: number;
-              eye_distance: number; nose_to_chin: number;
-              mouth_width: number; nose_width: number;
+              face_width: number;
+              face_height: number;
+              eye_distance: number;
+              nose_to_chin: number;
+              mouth_width: number;
+              nose_width: number;
+              jaw_width?: number;
+              forehead_width?: number;
+              cheekbone_width?: number;
             };
             ratios?: {
-              eye_to_face_width: number; nose_to_face_height: number;
-              face_aspect_ratio: number; mouth_to_face_width: number;
+              eye_to_face_width: number;
+              nose_to_face_height: number;
+              face_aspect_ratio: number;
+              mouth_to_face_width: number;
+              nose_to_face_width?: number;
+              jaw_to_face_width?: number;
+              forehead_to_jaw?: number;
+              cheekbone_to_jaw?: number;
             };
             analysis?: {
               overall_score: number;
@@ -100,7 +128,6 @@ const DrawMode = () => {
 
           if (data.status === "ping") return;
 
-          // Always show frame (annotated or raw)
           if (data.frame) {
             setAnnotatedFrame(`data:image/jpeg;base64,${data.frame}`);
           }
@@ -109,25 +136,47 @@ const DrawMode = () => {
             setGridData(data);
           }
 
+          if (data.status === "no_face") {
+            setPoseData(null);
+            setMeasurements(null);
+            setRatios(null);
+            setAnalysis(null);
+            return;
+          }
+
+          if (data.status === "error") {
+            setPoseData(null);
+            setMeasurements(null);
+            setRatios(null);
+            setAnalysis(null);
+            return;
+          }
+
           if (data.pose && data.view_type) {
             setPoseData({
-              pitch:     data.pose.pitch,
-              yaw:       data.pose.yaw,
-              roll:      data.pose.roll,
+              pitch: data.pose.pitch,
+              yaw: data.pose.yaw,
+              roll: data.pose.roll,
               view_type: data.view_type,
             });
+          } else {
+            setPoseData(null);
           }
 
           if (data.measurements) setMeasurements(data.measurements);
-          if (data.ratios)       setRatios(data.ratios);
-          if (data.analysis)     setAnalysis(data.analysis);
+          else setMeasurements(null);
 
-          // FPS counter
+          if (data.ratios) setRatios(data.ratios);
+          else setRatios(null);
+
+          if (data.analysis) setAnalysis(data.analysis);
+          else setAnalysis(null);
+
           fpsCounterRef.current.frames++;
           const now = Date.now();
           if (now - fpsCounterRef.current.lastTime >= 1000) {
             setFps(fpsCounterRef.current.frames);
-            fpsCounterRef.current.frames  = 0;
+            fpsCounterRef.current.frames = 0;
             fpsCounterRef.current.lastTime = now;
           }
         } catch (err) {
@@ -161,11 +210,10 @@ const DrawMode = () => {
     }
   }, []);
 
-  // ── Frame sender ────────────────────────────────────────────────────
   const sendFrame = useCallback(() => {
     if (!isRunningRef.current) return;
 
-    const now          = Date.now();
+    const now = Date.now();
     const MIN_INTERVAL = showGridRef.current ? 100 : 60;
 
     if (
@@ -186,7 +234,7 @@ const DrawMode = () => {
             ) {
               frameCountRef.current++;
               waitingResponseRef.current = true;
-              lastSentTimeRef.current    = Date.now();
+              lastSentTimeRef.current = Date.now();
               wsRef.current.send(blob);
             }
           },
@@ -199,14 +247,14 @@ const DrawMode = () => {
     animFrameRef.current = requestAnimationFrame(sendFrame);
   }, []);
 
-  // ── Camera controls ─────────────────────────────────────────────────
   const startCamera = useCallback(() => {
-    isRunningRef.current       = true;
+    isRunningRef.current = true;
     waitingResponseRef.current = false;
-    lastSentTimeRef.current    = 0;
+    lastSentTimeRef.current = 0;
     setIsCameraOn(true);
     setPermissionError(false);
     setAnnotatedFrame(null);
+    setGridData(null);
     setPoseData(null);
     setMeasurements(null);
     setRatios(null);
@@ -215,7 +263,7 @@ const DrawMode = () => {
   }, []);
 
   const stopCamera = useCallback(() => {
-    isRunningRef.current       = false;
+    isRunningRef.current = false;
     waitingResponseRef.current = false;
     setIsCameraOn(false);
     setGridData(null);
@@ -250,10 +298,9 @@ const DrawMode = () => {
     setIsCameraOn(false);
   }, []);
 
-  // ── Cleanup on unmount ───────────────────────────────────────────────
   useEffect(() => {
     return () => {
-      isRunningRef.current       = false;
+      isRunningRef.current = false;
       waitingResponseRef.current = false;
       if (pingIntervalRef.current) clearInterval(pingIntervalRef.current);
       if (wsRef.current) wsRef.current.close();
@@ -284,14 +331,12 @@ const DrawMode = () => {
           </motion.div>
 
           <div className="grid lg:grid-cols-3 gap-8">
-            {/* ── Left: Video + All Panels ── */}
             <motion.div
               initial={{ opacity: 0, y: 20 }}
               animate={{ opacity: 1, y: 0 }}
               transition={{ duration: 0.5, delay: 0.1 }}
               className="lg:col-span-2 flex flex-col gap-4"
             >
-              {/* Video card */}
               <div className="glass-card overflow-hidden">
                 <div className="relative aspect-video bg-muted/30">
                   {isCameraOn ? (
@@ -344,9 +389,17 @@ const DrawMode = () => {
                         : "bg-primary text-primary-foreground hover:opacity-90"
                     }`}
                   >
-                    {isCameraOn
-                      ? <><CameraOff className="h-4 w-4" />Stop Camera</>
-                      : <><Camera className="h-4 w-4" />Start Camera</>}
+                    {isCameraOn ? (
+                      <>
+                        <CameraOff className="h-4 w-4" />
+                        Stop Camera
+                      </>
+                    ) : (
+                      <>
+                        <Camera className="h-4 w-4" />
+                        Start Camera
+                      </>
+                    )}
                   </button>
 
                   {isCameraOn && (
@@ -358,15 +411,22 @@ const DrawMode = () => {
                           : "bg-secondary/60 text-muted-foreground hover:text-foreground"
                       }`}
                     >
-                      {showGrid
-                        ? <><Eye className="h-4 w-4" />Grid On</>
-                        : <><EyeOff className="h-4 w-4" />Grid Off</>}
+                      {showGrid ? (
+                        <>
+                          <Eye className="h-4 w-4" />
+                          Grid On
+                        </>
+                      ) : (
+                        <>
+                          <EyeOff className="h-4 w-4" />
+                          Grid Off
+                        </>
+                      )}
                     </button>
                   )}
                 </div>
               </div>
 
-              {/* ── Head Pose Table ── */}
               {poseData && isCameraOn && (
                 <motion.div
                   initial={{ opacity: 0, y: 10 }}
@@ -387,23 +447,41 @@ const DrawMode = () => {
                     <tbody className="divide-y divide-border/20">
                       <tr>
                         <td className="py-2 px-3 font-medium">Pitch</td>
-                        <td className="py-2 px-3 text-right font-mono text-primary">{poseData.pitch.toFixed(1)}°</td>
+                        <td className="py-2 px-3 text-right font-mono text-primary">
+                          {poseData.pitch.toFixed(1)}°
+                        </td>
                         <td className="py-2 px-3 text-right text-muted-foreground text-xs">
-                          {poseData.pitch > 5 ? "Looking Down" : poseData.pitch < -5 ? "Looking Up" : "Level"}
+                          {poseData.pitch > 5
+                            ? "Looking Down"
+                            : poseData.pitch < -5
+                            ? "Looking Up"
+                            : "Level"}
                         </td>
                       </tr>
                       <tr>
                         <td className="py-2 px-3 font-medium">Yaw</td>
-                        <td className="py-2 px-3 text-right font-mono text-primary">{poseData.yaw.toFixed(1)}°</td>
+                        <td className="py-2 px-3 text-right font-mono text-primary">
+                          {poseData.yaw.toFixed(1)}°
+                        </td>
                         <td className="py-2 px-3 text-right text-muted-foreground text-xs">
-                          {poseData.yaw > 5 ? "Turned Right" : poseData.yaw < -5 ? "Turned Left" : "Center"}
+                          {poseData.yaw > 5
+                            ? "Turned Right"
+                            : poseData.yaw < -5
+                            ? "Turned Left"
+                            : "Center"}
                         </td>
                       </tr>
                       <tr>
                         <td className="py-2 px-3 font-medium">Roll</td>
-                        <td className="py-2 px-3 text-right font-mono text-primary">{poseData.roll.toFixed(1)}°</td>
+                        <td className="py-2 px-3 text-right font-mono text-primary">
+                          {poseData.roll.toFixed(1)}°
+                        </td>
                         <td className="py-2 px-3 text-right text-muted-foreground text-xs">
-                          {poseData.roll > 5 ? "Tilted Right" : poseData.roll < -5 ? "Tilted Left" : "Straight"}
+                          {poseData.roll > 5
+                            ? "Tilted Right"
+                            : poseData.roll < -5
+                            ? "Tilted Left"
+                            : "Straight"}
                         </td>
                       </tr>
                       <tr>
@@ -417,7 +495,6 @@ const DrawMode = () => {
                 </motion.div>
               )}
 
-              {/* ── Detailed Measurements ── */}
               {measurements && isCameraOn && (
                 <motion.div
                   initial={{ opacity: 0, y: 10 }}
@@ -432,27 +509,27 @@ const DrawMode = () => {
                       {
                         label: "Face Dimensions",
                         value: `${measurements.face_width.toFixed(0)} × ${measurements.face_height.toFixed(0)} px`,
-                        sub:   `${(measurements.face_width * 0.0264).toFixed(1)} × ${(measurements.face_height * 0.0264).toFixed(1)} cm`,
+                        sub: `${(measurements.face_width * 0.0264).toFixed(1)} × ${(measurements.face_height * 0.0264).toFixed(1)} cm`,
                       },
                       {
                         label: "Eye Distance",
                         value: `${measurements.eye_distance.toFixed(0)} px`,
-                        sub:   `${(measurements.eye_distance * 0.0264).toFixed(1)} cm`,
+                        sub: `${(measurements.eye_distance * 0.0264).toFixed(1)} cm`,
                       },
                       {
                         label: "Nose to Chin",
                         value: `${measurements.nose_to_chin.toFixed(0)} px`,
-                        sub:   `${(measurements.nose_to_chin * 0.0264).toFixed(1)} cm`,
+                        sub: `${(measurements.nose_to_chin * 0.0264).toFixed(1)} cm`,
                       },
                       {
                         label: "Mouth Width",
                         value: `${measurements.mouth_width.toFixed(0)} px`,
-                        sub:   `${(measurements.mouth_width * 0.0264).toFixed(1)} cm`,
+                        sub: `${(measurements.mouth_width * 0.0264).toFixed(1)} cm`,
                       },
                       {
                         label: "Nose Width",
                         value: `${measurements.nose_width.toFixed(0)} px`,
-                        sub:   `${(measurements.nose_width * 0.0264).toFixed(1)} cm`,
+                        sub: `${(measurements.nose_width * 0.0264).toFixed(1)} cm`,
                       },
                     ].map((row) => (
                       <div
@@ -470,7 +547,6 @@ const DrawMode = () => {
                 </motion.div>
               )}
 
-              {/* ── Proportional Ratios ── */}
               {ratios && isCameraOn && (
                 <motion.div
                   initial={{ opacity: 0, y: 10 }}
@@ -482,14 +558,16 @@ const DrawMode = () => {
                   </h3>
                   <div className="space-y-4">
                     {[
-                      { label: "Eye to Face Width",   value: ratios.eye_to_face_width,   ideal: 0.46 },
+                      { label: "Eye to Face Width", value: ratios.eye_to_face_width, ideal: 0.46 },
                       { label: "Nose to Face Height", value: ratios.nose_to_face_height, ideal: 0.33 },
-                      { label: "Face Aspect Ratio",   value: ratios.face_aspect_ratio,   ideal: 0.75 },
+                      { label: "Face Aspect Ratio", value: ratios.face_aspect_ratio, ideal: 0.75 },
                       { label: "Mouth to Face Width", value: ratios.mouth_to_face_width, ideal: 0.46 },
                     ].map((row) => {
-                      const diff     = Math.abs(row.value - row.ideal);
-                      const pct      = Math.max(0, Math.min(100, 100 - diff * 200));
-                      const barColor = pct >= 85 ? "bg-green-500" : pct >= 60 ? "bg-yellow-500" : "bg-red-500";
+                      const diff = Math.abs(row.value - row.ideal);
+                      const pct = Math.max(0, Math.min(100, 100 - diff * 200));
+                      const barColor =
+                        pct >= 85 ? "bg-green-500" : pct >= 60 ? "bg-yellow-500" : "bg-red-500";
+
                       return (
                         <div key={row.label}>
                           <div className="flex justify-between text-sm mb-1.5">
@@ -512,7 +590,6 @@ const DrawMode = () => {
                 </motion.div>
               )}
 
-              {/* ── Proportion Analysis ── */}
               {analysis && isCameraOn && (
                 <motion.div
                   initial={{ opacity: 0, y: 10 }}
@@ -527,15 +604,25 @@ const DrawMode = () => {
                       {analysis.face_shape}
                     </span>
                   </div>
+
                   <div className="space-y-4">
                     {Object.entries(analysis.comparisons).map(([key, val]) => {
                       const label =
-                        key === "eye_spacing"     ? "Eye Spacing"      :
-                        key === "nose_chin_ratio" ? "Nose-Chin Ratio"  :
-                        key === "face_aspect"     ? "Face Aspect Ratio": key;
+                        key === "eye_spacing"
+                          ? "Eye Spacing"
+                          : key === "nose_chin_ratio"
+                          ? "Nose-Chin Ratio"
+                          : key === "face_aspect"
+                          ? "Face Aspect Ratio"
+                          : key;
+
                       const scoreColor =
-                        val.score >= 85 ? "text-green-400" :
-                        val.score >= 60 ? "text-yellow-400" : "text-red-400";
+                        val.score >= 85
+                          ? "text-green-400"
+                          : val.score >= 60
+                          ? "text-yellow-400"
+                          : "text-red-400";
+
                       return (
                         <div key={key} className="flex items-start justify-between">
                           <div>
@@ -551,19 +638,24 @@ const DrawMode = () => {
                       );
                     })}
                   </div>
+
                   <div className="mt-4 pt-3 border-t border-border/30 flex justify-between items-center">
                     <span className="text-sm text-muted-foreground">Overall Score</span>
-                    <span className={`text-2xl font-black ${
-                      analysis.overall_score >= 85 ? "text-green-400" :
-                      analysis.overall_score >= 60 ? "text-yellow-400" : "text-red-400"
-                    }`}>
+                    <span
+                      className={`text-2xl font-black ${
+                        analysis.overall_score >= 85
+                          ? "text-green-400"
+                          : analysis.overall_score >= 60
+                          ? "text-yellow-400"
+                          : "text-red-400"
+                      }`}
+                    >
                       {analysis.overall_score.toFixed(1)}%
                     </span>
                   </div>
                 </motion.div>
               )}
 
-              {/* ── Permission Error ── */}
               {permissionError && (
                 <motion.div
                   initial={{ opacity: 0, y: 10 }}
@@ -581,18 +673,13 @@ const DrawMode = () => {
               )}
             </motion.div>
 
-            {/* ── Right: Live Info Panel ── */}
             <motion.div
               initial={{ opacity: 0, x: 20 }}
               animate={{ opacity: 1, x: 0 }}
               transition={{ duration: 0.5, delay: 0.2 }}
             >
               <h2 className="text-xl font-bold mb-4">Live Data</h2>
-              <LiveInfoPanel
-                data={gridData}
-                isConnected={isConnected}
-                fps={fps}
-              />
+              <LiveInfoPanel data={gridData} isConnected={isConnected} fps={fps} />
             </motion.div>
           </div>
         </div>
